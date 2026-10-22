@@ -19,5 +19,8 @@
         <activity
             android:name=".MumbaQcfaReprocProbeActivity"
             android:exported="true" />
+        <activity
+            android:name=".MumbaCameraXProbeActivity"
+            android:exported="true" />
     </application>
 </manifest>

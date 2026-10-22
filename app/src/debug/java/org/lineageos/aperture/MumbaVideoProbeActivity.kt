@@ -39,12 +39,15 @@ class MumbaVideoProbeActivity : Activity() {
     private val useHevc by lazy { intent.getStringExtra("codec") != "avc" }
     private val useEis by lazy { intent.getBooleanExtra("eis", true) }
     private val hdrMode by lazy { intent.getIntExtra("hdr", 0) }
+    private val videoBitrate by lazy { intent.getIntExtra("vbitrate", 0) }
+    private val audioBitrate by lazy { intent.getIntExtra("abitrate", 0) }
+    private val withAudio by lazy { intent.getBooleanExtra("audio", false) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         textView = TextView(this).apply { textSize = 11f; setPadding(24, 24, 24, 24) }
         setContentView(ScrollView(this).apply { addView(textView) })
-        append("Mumba video probe ${width}x$height@$fps codec=${if (useHevc) "hevc" else "avc"} eis=$useEis hdr=$hdrMode")
+        append("Mumba video probe ${width}x$height@$fps codec=${if (useHevc) "hevc" else "avc"} eis=$useEis hdr=$hdrMode vbr=$videoBitrate abr=$audioBitrate audio=$withAudio")
         try {
             start()
         } catch (t: Throwable) {
@@ -69,11 +72,20 @@ class MumbaVideoProbeActivity : Activity() {
 
         recorder = MediaRecorder(this).apply {
             setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            if (withAudio) setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
             setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             setVideoEncoder(if (useHevc) MediaRecorder.VideoEncoder.HEVC else MediaRecorder.VideoEncoder.H264)
             setVideoSize(width, height)
             setVideoFrameRate(fps)
-            setVideoEncodingBitRate(if (width >= 2560) 24_000_000 else 16_000_000)
+            setVideoEncodingBitRate(
+                if (videoBitrate > 0) videoBitrate else if (width >= 2560) 24_000_000 else 16_000_000
+            )
+            if (withAudio) {
+                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setAudioSamplingRate(48_000)
+                setAudioChannels(2)
+                setAudioEncodingBitRate(if (audioBitrate > 0) audioBitrate else 256_000)
+            }
             setOrientationHint(90)
             file = File(getExternalFilesDir(null), "mumba-${width}x${height}-${fps}-${if (useHevc) "hevc" else "avc"}.mp4").apply {
                 delete()

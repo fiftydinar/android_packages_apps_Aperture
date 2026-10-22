@@ -117,16 +117,25 @@ class Camera private constructor(
             )
         }.toMutableMap().apply {
             if (cameraFacing == CameraFacing.BACK) {
-                for (quality in listOf(Quality.HD, Quality.FHD)) {
-                    get(quality)?.let {
-                        put(
-                            quality,
-                            it.copy(
-                                supportedDynamicRanges = it.supportedDynamicRanges +
-                                        VideoDynamicRange.HLG_8_BIT
-                            )
+                get(Quality.HD)?.let {
+                    put(
+                        Quality.HD,
+                        it.copy(
+                            supportedFrameRates = it.supportedFrameRates +
+                                    FrameRate.FPS_120,
+                            supportedDynamicRanges = it.supportedDynamicRanges +
+                                    VideoDynamicRange.HLG_8_BIT,
                         )
-                    }
+                    )
+                }
+                get(Quality.FHD)?.let {
+                    put(
+                        Quality.FHD,
+                        it.copy(
+                            supportedDynamicRanges = it.supportedDynamicRanges +
+                                    VideoDynamicRange.HLG_8_BIT
+                        )
+                    )
                 }
                 putIfAbsent(
                     Quality.QHD,

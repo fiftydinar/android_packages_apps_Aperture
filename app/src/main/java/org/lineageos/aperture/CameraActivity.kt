@@ -28,6 +28,7 @@ import android.util.Range
 import android.view.GestureDetector
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.TextureView
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
@@ -111,6 +112,7 @@ import org.lineageos.aperture.models.CameraFacing
 import org.lineageos.aperture.models.CameraMode
 import org.lineageos.aperture.models.CameraState
 import org.lineageos.aperture.models.Event
+import org.lineageos.aperture.models.FrameRate
 import org.lineageos.aperture.models.FlashMode
 import org.lineageos.aperture.models.GestureAction
 import org.lineageos.aperture.models.GridMode
@@ -175,6 +177,10 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
     private val levelerView by lazy { findViewById<LevelerView>(R.id.levelerView) }
     private val mainLayout by lazy { findViewById<ConstraintLayout>(R.id.mainLayout) }
     private val micButton by lazy { findViewById<Button>(R.id.micButton) }
+    private val mumbaHighSpeedPreview by lazy { findViewById<TextureView>(R.id.mumbaHighSpeedPreview) }
+    private val mumbaHighSpeedEngine by lazy { MumbaHighSpeedEngine(this) }
+    private var isMumbaHighSpeedMode = false
+    private var currentCameraConfiguration: CameraConfiguration? = null
     private val previewBlurView by lazy { findViewById<PreviewBlurView>(R.id.previewBlurView) }
     private val proButton by lazy { findViewById<ImageButton>(R.id.proButton) }
     private val screenFlashView by lazy { findViewById<ScreenFlashView>(R.id.screenFlashView) }
@@ -190,6 +196,30 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
     private val viewFinder by lazy { findViewById<PreviewView>(R.id.viewFinder) }
     private val viewFinderFocus by lazy { findViewById<ImageView>(R.id.viewFinderFocus) }
     private val zoomLevel by lazy { findViewById<HorizontalSlider>(R.id.zoomLevel) }
+
+    private val mumbaHighSpeedListener = object : MumbaHighSpeedEngine.Listener {
+        override fun onRecordingStarted(uri: Uri?) = runOnUiThread {
+            viewModel.cameraState.value = CameraState.RECORDING_VIDEO
+        }
+
+        override fun onRecordingStopped(uri: Uri?) = runOnUiThread {
+            viewModel.cameraState.value = CameraState.IDLE
+            viewModel.videoRecordingDuration.value = 0
+            uri?.let { onCapturedMedia(it) }
+        }
+
+        override fun onRecordingDuration(durationNanos: Long) {
+            viewModel.videoRecordingDuration.value = durationNanos
+        }
+
+        override fun onError(message: String) {
+            Log.e(LOG_TAG, "Mumba high-speed: $message")
+            runOnUiThread {
+                Toast.makeText(this@CameraActivity, message, Toast.LENGTH_SHORT).show()
+                viewModel.cameraState.value = CameraState.IDLE
+            }
+        }
+    }
 
     // System services
     private val keyguardManager by lazy { getSystemService(KeyguardManager::class.java) }
@@ -518,10 +548,30 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         flipCameraButton.setOnClickListener { viewModel.flipCamera() }
 
         videoRecordingStateButton.setOnClickListener {
-            viewModel.onVideoRecordingStateButtonPress()
+            if (!isMumbaHighSpeedMode) {
+                viewModel.onVideoRecordingStateButtonPress()
+            }
         }
 
         shutterButton.setOnClickListener {
+            if (viewModel.cameraMode.value == CameraMode.VIDEO && isMumbaHighSpeedMode) {
+                when (viewModel.cameraState.value) {
+                    CameraState.RECORDING_VIDEO -> {
+                        startShutterAnimation(ShutterAnimation.VideoEnd)
+                        mumbaHighSpeedEngine.stopRecording()
+                    }
+
+                    CameraState.IDLE -> {
+                        startShutterAnimation(ShutterAnimation.VideoStart)
+                        viewModel.cameraState.value = CameraState.PRE_RECORDING_VIDEO
+                        startTimerAndRun { mumbaHighSpeedEngine.startRecording() }
+                    }
+
+                    else -> {}
+                }
+                return@setOnClickListener
+            }
+
             // Shutter animation
             when (viewModel.cameraMode.value) {
                 CameraMode.PHOTO -> startShutterAnimation(ShutterAnimation.PhotoCapture)
@@ -638,7 +688,25 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         }
     }
 
+    override fun onPause() {
+        if (isMumbaHighSpeedMode) {
+            mumbaHighSpeedEngine.release()
+            viewModel.cameraState.value = CameraState.IDLE
+            viewModel.videoRecordingDuration.value = 0
+        }
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (isMumbaHighSpeedMode) {
+            currentCameraConfiguration?.let { bindCameraUseCases(it) }
+        }
+    }
+
     override fun onDestroy() {
+        mumbaHighSpeedEngine.release()
+
         // Detach CameraController from ScreenFlashView
         screenFlashView.setController(null)
 
@@ -714,6 +782,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
 
         launch {
             viewModel.cameraConfiguration.collectLatest { cameraConfiguration ->
+                currentCameraConfiguration = cameraConfiguration
                 bindCameraUseCases(cameraConfiguration)
             }
         }
@@ -885,7 +954,8 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                 galleryButtonCardView.isEnabled = cameraState == CameraState.IDLE
                 // Shutter button must stay enabled
                 flipCameraButton.isEnabled = cameraState == CameraState.IDLE
-                videoRecordingStateButton.isVisible = cameraState.isRecordingVideo
+                videoRecordingStateButton.isVisible =
+                    cameraState.isRecordingVideo && !isMumbaHighSpeedMode
 
                 // Update camera mode selector
                 cameraModeSelectorLayout.setCameraState(cameraState)
@@ -1535,6 +1605,33 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
     private fun bindCameraUseCases(cameraConfiguration: CameraConfiguration) {
         require(viewModel.cameraState.value == CameraState.IDLE) {
             "Trying to rebind camera while camera is not in IDLE state"
+        }
+
+        val highSpeedVideo = cameraConfiguration is CameraConfiguration.Video &&
+                cameraConfiguration.videoQuality == Quality.HD &&
+                cameraConfiguration.videoFrameRate == FrameRate.FPS_120
+
+        if (highSpeedVideo) {
+            previewBlurView.isVisible = false
+            viewModel.cameraController.unbind()
+            viewFinder.isInvisible = true
+            mumbaHighSpeedPreview.isVisible = true
+            isMumbaHighSpeedMode = true
+            mumbaHighSpeedEngine.attach(
+                mumbaHighSpeedPreview,
+                cameraConfiguration.camera.cameraId,
+                viewModel.videoCodecMime,
+                viewModel.videoMicMode.value,
+                mumbaHighSpeedListener,
+            )
+            return
+        }
+
+        if (isMumbaHighSpeedMode) {
+            isMumbaHighSpeedMode = false
+            mumbaHighSpeedEngine.release()
+            mumbaHighSpeedPreview.isVisible = false
+            viewFinder.isInvisible = false
         }
 
         // Show blurred preview

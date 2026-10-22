@@ -237,6 +237,7 @@ class MumbaHighSpeedEngine(private val context: Context) {
                 prepare()
             }
         } catch (t: Throwable) {
+            Log.w(tag, "warmup prepare failed", t)
             warmingUp = false
             warmUpNeeded = false
             file.delete()
@@ -248,13 +249,14 @@ class MumbaHighSpeedEngine(private val context: Context) {
         session = null
         try {
             device.createConstrainedHighSpeedCaptureSession(
-                listOf(rec.surface),
+                listOfNotNull(ensurePreviewSurface(), rec.surface),
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(s: CameraCaptureSession) {
                         try {
                             val hs = s as android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
                             val request = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                                 addTarget(rec.surface)
+                                previewSurface?.let { addTarget(it) }
                                 applyCommonOptions(this)
                                 setFpsRange(device, this)
                             }
@@ -271,6 +273,7 @@ class MumbaHighSpeedEngine(private val context: Context) {
                                 startPreview()
                             }, 1500)
                         } catch (t: Throwable) {
+                            Log.w(tag, "warmup configure failed", t)
                             try { rec.release() } catch (_: Throwable) {}
                             file.delete()
                             warmingUp = false
@@ -280,6 +283,7 @@ class MumbaHighSpeedEngine(private val context: Context) {
                     }
 
                     override fun onConfigureFailed(s: CameraCaptureSession) {
+                        Log.w(tag, "warmup session failed")
                         try { rec.release() } catch (_: Throwable) {}
                         file.delete()
                         warmingUp = false

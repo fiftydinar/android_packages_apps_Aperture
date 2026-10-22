@@ -56,6 +56,7 @@ class MumbaHighSpeedEngine(private val context: Context) {
     private var listener: Listener? = null
     private var recording = false
     private var startedAt = 0L
+    private var generation = 0
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -92,32 +93,46 @@ class MumbaHighSpeedEngine(private val context: Context) {
             override fun onSurfaceTextureUpdated(st: SurfaceTexture) = Unit
         }
         if (textureView.isAvailable) {
-            textureView.surfaceTexture?.setDefaultBufferSize(1280, 720)
-            previewSurface = Surface(textureView.surfaceTexture)
+            ensurePreviewSurface()
             openCamera()
         }
     }
 
     private fun openCamera(retry: Int = 0) {
         if (camera != null) return
+        val gen = ++generation
         try {
             cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(device: CameraDevice) {
+                    if (gen != generation) {
+                        device.close()
+                        return
+                    }
                     camera = device
                     startPreview()
                 }
 
                 override fun onDisconnected(device: CameraDevice) {
+                    if (gen != generation) return
                     camera = null
+                    if (retry < 6) {
+                        handler.postDelayed({ openCamera(retry + 1) }, 300)
+                    }
                 }
 
                 override fun onError(device: CameraDevice, error: Int) {
+                    if (gen != generation) return
                     camera = null
-                    if (error == CameraDevice.StateCallback.ERROR_CAMERA_IN_USE && retry < 6) {
-                        handler.postDelayed({ openCamera(retry + 1) }, 300)
-                    } else {
-                        listener?.onError("camera error=$error")
+                    if (
+                        error == CameraDevice.StateCallback.ERROR_CAMERA_IN_USE ||
+                        error == CameraDevice.StateCallback.ERROR_CAMERA_DEVICE
+                    ) {
+                        if (retry < 6) {
+                            handler.postDelayed({ openCamera(retry + 1) }, 300)
+                            return
+                        }
                     }
+                    listener?.onError("camera error=$error")
                 }
             }, handler)
         } catch (t: Throwable) {
@@ -129,15 +144,25 @@ class MumbaHighSpeedEngine(private val context: Context) {
         }
     }
 
+    private fun ensurePreviewSurface(): Surface? {
+        val texture = textureView?.surfaceTexture ?: return null
+        texture.setDefaultBufferSize(1280, 720)
+        try { previewSurface?.release() } catch (_: Throwable) {}
+        previewSurface = Surface(texture)
+        return previewSurface
+    }
+
     private fun startPreview() {
         val device = camera ?: return
-        val surface = previewSurface ?: return
+        val gen = generation
         try { session?.close() } catch (_: Throwable) {}
+        val surface = ensurePreviewSurface() ?: return
         try {
             device.createConstrainedHighSpeedCaptureSession(
                 listOf(surface),
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(s: CameraCaptureSession) {
+                        if (gen != generation) return
                         session = s
                         try {
                             val hs = s as android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
@@ -149,17 +174,20 @@ class MumbaHighSpeedEngine(private val context: Context) {
                             }
                             hs.setRepeatingBurst(hs.createHighSpeedRequestList(request.build()), null, handler)
                         } catch (t: Throwable) {
-                            listener?.onError("preview failed: ${t.message}")
+                            if (gen == generation) listener?.onError("preview failed: ${t.message}")
                         }
                     }
 
                     override fun onConfigureFailed(s: CameraCaptureSession) {
-                        listener?.onError("preview configure failed")
+                        if (gen == generation) {
+                            camera = null
+                            handler.postDelayed({ openCamera() }, 300)
+                        }
                     }
                 }, handler
             )
         } catch (t: Throwable) {
-            listener?.onError("preview session failed: ${t.message}")
+            if (gen == generation) listener?.onError("preview session failed: ${t.message}")
         }
     }
 
@@ -214,6 +242,7 @@ class MumbaHighSpeedEngine(private val context: Context) {
         try { session?.stopRepeating() } catch (_: Throwable) {}
         try { session?.close() } catch (_: Throwable) {}
         session = null
+        ensurePreviewSurface()
 
         val callback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(s: CameraCaptureSession) {
@@ -285,6 +314,7 @@ class MumbaHighSpeedEngine(private val context: Context) {
     }
 
     fun release() {
+        generation++
         if (recording) {
             recording = false
             handler.removeCallbacks(ticker)

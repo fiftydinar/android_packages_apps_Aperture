@@ -57,6 +57,8 @@ class MumbaHighSpeedEngine(private val context: Context) {
     private var recording = false
     private var startedAt = 0L
     private var generation = 0
+    private var warmUpNeeded = false
+    private var warmingUp = false
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -75,6 +77,7 @@ class MumbaHighSpeedEngine(private val context: Context) {
         this.codecMime = codecMime
         this.audioEnabled = audioEnabled
         this.listener = listener
+        warmUpNeeded = true
         textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
                 st.setDefaultBufferSize(1280, 720)
@@ -166,13 +169,15 @@ class MumbaHighSpeedEngine(private val context: Context) {
                         session = s
                         try {
                             val hs = s as android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
-                            val request = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                            val request = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                                 addTarget(surface)
-                                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                                applyCommonOptions(this)
                                 setFpsRange(device, this)
                             }
                             hs.setRepeatingBurst(hs.createHighSpeedRequestList(request.build()), null, handler)
+                            if (warmUpNeeded && !warmingUp) {
+                                handler.postDelayed({ warmUp() }, 100)
+                            }
                         } catch (t: Throwable) {
                             if (gen == generation) listener?.onError("preview failed: ${t.message}")
                         }
@@ -191,6 +196,18 @@ class MumbaHighSpeedEngine(private val context: Context) {
         }
     }
 
+    private fun applyCommonOptions(builder: CaptureRequest.Builder) {
+        builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+        builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+        builder.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO)
+        builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+        builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+        builder.set(
+            CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+            CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF,
+        )
+    }
+
     private fun setFpsRange(device: CameraDevice, builder: CaptureRequest.Builder) {
         val ranges = device.cameraCharacteristics()
             ?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
@@ -199,9 +216,90 @@ class MumbaHighSpeedEngine(private val context: Context) {
             ?.let { builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
     }
 
+    private fun warmUp() {
+        val device = camera ?: return
+        if (warmingUp || recording) return
+        warmingUp = true
+        val file = File(context.cacheDir, "mumba-warmup.mp4").apply { delete() }
+        val rec = try {
+            MediaRecorder().apply {
+                setVideoSource(MediaRecorder.VideoSource.SURFACE)
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                setVideoEncoder(
+                    if (codecMime == "video/hevc") MediaRecorder.VideoEncoder.HEVC
+                    else MediaRecorder.VideoEncoder.H264
+                )
+                setVideoSize(1280, 720)
+                setVideoFrameRate(120)
+                setVideoEncodingBitRate(55_000_000)
+                setOrientationHint(90)
+                setOutputFile(file.absolutePath)
+                prepare()
+            }
+        } catch (t: Throwable) {
+            warmingUp = false
+            warmUpNeeded = false
+            file.delete()
+            startPreview()
+            return
+        }
+        try { session?.stopRepeating() } catch (_: Throwable) {}
+        try { session?.close() } catch (_: Throwable) {}
+        session = null
+        try {
+            device.createConstrainedHighSpeedCaptureSession(
+                listOf(rec.surface),
+                object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(s: CameraCaptureSession) {
+                        try {
+                            val hs = s as android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
+                            val request = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                                addTarget(rec.surface)
+                                applyCommonOptions(this)
+                                setFpsRange(device, this)
+                            }
+                            hs.setRepeatingBurst(hs.createHighSpeedRequestList(request.build()), null, handler)
+                            rec.start()
+                            handler.postDelayed({
+                                try { hs.stopRepeating() } catch (_: Throwable) {}
+                                try { rec.stop() } catch (_: Throwable) {}
+                                try { rec.release() } catch (_: Throwable) {}
+                                try { s.close() } catch (_: Throwable) {}
+                                file.delete()
+                                warmingUp = false
+                                warmUpNeeded = false
+                                startPreview()
+                            }, 1500)
+                        } catch (t: Throwable) {
+                            try { rec.release() } catch (_: Throwable) {}
+                            file.delete()
+                            warmingUp = false
+                            warmUpNeeded = false
+                            startPreview()
+                        }
+                    }
+
+                    override fun onConfigureFailed(s: CameraCaptureSession) {
+                        try { rec.release() } catch (_: Throwable) {}
+                        file.delete()
+                        warmingUp = false
+                        warmUpNeeded = false
+                        startPreview()
+                    }
+                }, handler
+            )
+        } catch (t: Throwable) {
+            try { rec.release() } catch (_: Throwable) {}
+            file.delete()
+            warmingUp = false
+            warmUpNeeded = false
+            startPreview()
+        }
+    }
+
     fun startRecording() {
         val device = camera ?: return
-        if (recording) return
+        if (recording || warmingUp) return
         val output = createOutput() ?: run {
             listener?.onError("cannot create output")
             return
@@ -251,8 +349,7 @@ class MumbaHighSpeedEngine(private val context: Context) {
                     val request = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                         addTarget(rec.surface)
                         previewSurface?.let { addTarget(it) }
-                        set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                        set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                        applyCommonOptions(this)
                         setFpsRange(device, this)
                     }
                     hs.setRepeatingBurst(hs.createHighSpeedRequestList(request.build()), null, handler)
@@ -315,6 +412,8 @@ class MumbaHighSpeedEngine(private val context: Context) {
 
     fun release() {
         generation++
+        warmUpNeeded = false
+        warmingUp = false
         if (recording) {
             recording = false
             handler.removeCallbacks(ticker)

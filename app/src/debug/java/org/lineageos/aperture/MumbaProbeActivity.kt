@@ -42,6 +42,7 @@ class MumbaProbeActivity : Activity() {
         try {
             probe()
             printEncoders()
+            testEncoderConfigs()
         } catch (t: Throwable) {
             append("FATAL: ${t.stackTraceToString()}\n")
         }
@@ -71,6 +72,7 @@ class MumbaProbeActivity : Activity() {
         printSizes("JPEG", map.getOutputSizes(ImageFormat.JPEG))
         printSizes("JPEG high-res", map.getHighResolutionOutputSizes(ImageFormat.JPEG))
         printSizes("PRIVATE", map.getOutputSizes(ImageFormat.PRIVATE))
+        printSizes("P010", map.getOutputSizes(ImageFormat.YCBCR_P010))
         printSizes("video", map.getOutputSizes(android.media.MediaRecorder::class.java))
         append("high-speed sizes=${map.highSpeedVideoSizes?.joinToString()}")
         for (size in map.highSpeedVideoSizes.orEmpty()) {
@@ -162,16 +164,64 @@ class MumbaProbeActivity : Activity() {
     private fun printEncoders() {
         val list = android.media.MediaCodecList(android.media.MediaCodecList.ALL_CODECS)
         for (info in list.codecInfos) {
-            if (!info.isEncoder || info.supportedTypes.none { it.equals("video/hevc", true) }) continue
-            append("encoder ${info.name}")
-            try {
-                val caps = info.getCapabilitiesForType("video/hevc")
-                for (pl in caps.profileLevels) {
-                    append("  profile=${pl.profile} level=${pl.level}")
+            if (!info.isEncoder) continue
+            val videoTypes = info.supportedTypes.filter { it.startsWith("video/") }
+            if (videoTypes.isEmpty()) continue
+            append("encoder ${info.name} types=${videoTypes.joinToString()}")
+            for (type in videoTypes) {
+                try {
+                    val caps = info.getCapabilitiesForType(type)
+                    for (pl in caps.profileLevels) {
+                        append("  $type profile=${pl.profile} level=${pl.level}")
+                    }
+                    append("  $type colorFormats=${caps.colorFormats.joinToString()}")
+                } catch (t: Throwable) {
+                    append("  $type capabilities failed: ${t.message}")
                 }
-                append("  colorFormats=${caps.colorFormats.joinToString()}")
-            } catch (t: Throwable) {
-                append("  capabilities failed: ${t.message}")
+            }
+        }
+    }
+
+    private fun testEncoderConfigs() {
+        val codecs = listOf(
+            "c2.qti.hevc.encoder",
+            "c2.qti.hevc.encoder.cq",
+            "c2.android.hevc.encoder",
+            "c2.android.av1.encoder",
+        )
+        val colorFormats = listOf(
+            54 to "P010",
+            2135033992 to "flexible",
+            2130708361 to "surface",
+        )
+        val profiles = listOf(0, 1, 2, 4096, 8192)
+        for (name in codecs) {
+            for ((color, colorName) in colorFormats) {
+                for (profile in profiles) {
+                    var codec: android.media.MediaCodec? = null
+                    try {
+                        codec = android.media.MediaCodec.createByCodecName(name)
+                        val format = android.media.MediaFormat.createVideoFormat(
+                            if (name.contains("av1")) "video/av01" else "video/hevc",
+                            1920, 1080
+                        ).apply {
+                            setInteger(android.media.MediaFormat.KEY_COLOR_FORMAT, color)
+                            setInteger(android.media.MediaFormat.KEY_BIT_RATE, 16_000_000)
+                            setInteger(android.media.MediaFormat.KEY_FRAME_RATE, 30)
+                            setInteger(android.media.MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                            if (profile > 0) {
+                                setInteger(android.media.MediaFormat.KEY_PROFILE, profile)
+                                setInteger(android.media.MediaFormat.KEY_LEVEL, 65536)
+                            }
+                        }
+                        codec.configure(format, null, null, android.media.MediaCodec.CONFIGURE_FLAG_ENCODE)
+                        append("CFG OK $name color=$colorName profile=$profile")
+                    } catch (t: Throwable) {
+                        append("CFG FAIL $name color=$colorName profile=$profile ${t.javaClass.simpleName}: ${t.message}")
+                    } finally {
+                        try { codec?.release() } catch (_: Throwable) {}
+                    }
+                }
             }
         }
     }

@@ -13,5 +13,8 @@
         <activity
             android:name=".Mumba50ProbeActivity"
             android:exported="true" />
+        <activity
+            android:name=".MumbaSwHevcProbeActivity"
+            android:exported="true" />
     </application>
 </manifest>

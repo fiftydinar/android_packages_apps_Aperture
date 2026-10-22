@@ -50,12 +50,13 @@ class MumbaHdrProbeActivity : Activity() {
     private val profile by lazy { intent.getIntExtra("profile", 2) }
     private val level by lazy { intent.getIntExtra("level", 0) }
     private val color by lazy { intent.getBooleanExtra("color", true) }
+    private val codecName by lazy { intent.getStringExtra("codec") ?: "" }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         textView = TextView(this).apply { textSize = 11f; setPadding(24, 24, 24, 24) }
         setContentView(ScrollView(this).apply { addView(textView) })
-        append("Mumba HDR probe ${width}x$height@$fps hdr=$hdrMode transfer=$transfer profile=$profile level=$level color=$color")
+        append("Mumba HDR probe ${width}x$height@$fps hdr=$hdrMode transfer=$transfer profile=$profile level=$level color=$color codec=$codecName")
         try {
             start()
         } catch (t: Throwable) {
@@ -102,7 +103,7 @@ class MumbaHdrProbeActivity : Activity() {
                 append("format extras failed: ${t.message}")
             }
         }
-        encoder = MediaCodec.createEncoderByType("video/hevc")
+        encoder = if (codecName.isNotEmpty()) MediaCodec.createByCodecName(codecName) else MediaCodec.createEncoderByType("video/hevc")
         encoder!!.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         val input = encoder!!.createInputSurface()
         encoder!!.start()

@@ -189,7 +189,7 @@ class MumbaHighSpeedEngine(private val context: Context) {
                 )
                 setVideoSize(1280, 720)
                 setVideoFrameRate(120)
-                setVideoEncodingBitRate(55_000_000)
+                setVideoEncodingBitRate(80_000_000)
                 if (audioEnabled) {
                     setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
                     setAudioSamplingRate(48_000)

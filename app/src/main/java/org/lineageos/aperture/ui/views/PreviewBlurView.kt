@@ -10,6 +10,7 @@ import android.graphics.RenderEffect
 import android.graphics.Shader
 import android.os.Build
 import android.util.AttributeSet
+import android.view.TextureView
 import androidx.appcompat.widget.AppCompatImageView
 import androidx.camera.view.PreviewView
 import org.lineageos.aperture.ext.stackBlur
@@ -36,6 +37,16 @@ class PreviewBlurView @JvmOverloads constructor(
                 } else {
                     it.stackBlur(RADIUS.toInt())
                 }
+            )
+        } ?: setImageResource(android.R.color.black)
+    }
+
+    /** Freezes a Camera2 TextureView frame during the lens-engine handoff. */
+    fun freeze(textureView: TextureView) {
+        textureView.takeUnless { it.height <= 0 || it.width <= 0 }?.bitmap?.also {
+            setImageBitmap(
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) it
+                else it.stackBlur(RADIUS.toInt())
             )
         } ?: setImageResource(android.R.color.black)
     }

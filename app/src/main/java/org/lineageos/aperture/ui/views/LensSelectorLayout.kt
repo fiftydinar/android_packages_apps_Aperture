@@ -42,11 +42,17 @@ class LensSelectorLayout @JvmOverloads constructor(
     var onCameraChangeCallback: (camera: Camera) -> Unit = {}
     var onZoomRatioChangeCallback: (zoomRatio: Float) -> Unit = {}
     var onResetZoomRatioCallback: () -> Unit = {}
+    var onAuxLensClickCallback: () -> Unit = {}
+
+    private var auxButton: Button? = null
+    private var auxLensEnabled = false
+    private var auxLensActive = false
 
     fun setCamera(activeCamera: Camera, availableCameras: Collection<Camera>) {
         this.activeCamera = activeCamera
 
         removeAllViews()
+        auxButton = null
         buttonToApproximateZoomRatio.clear()
 
         buttonToCamera.clear()
@@ -90,6 +96,29 @@ class LensSelectorLayout @JvmOverloads constructor(
             }
         }
 
+        setAuxLens(auxLensEnabled, auxLensActive)
+    }
+
+    /** Adds the manual 0.6x selector before the CameraX-exposed main lens list. */
+    fun setAuxLens(enabled: Boolean, active: Boolean) {
+        auxButton?.let {
+            removeView(it)
+            buttonToApproximateZoomRatio.remove(it)
+        }
+        auxButton = null
+        auxLensEnabled = enabled
+        auxLensActive = active
+        if (enabled) {
+            val button = inflateButton().apply {
+                text = formatZoomRatio(AUX_LENS_ZOOM_RATIO)
+                setOnClickListener {
+                    if (!isSelected) onAuxLensClickCallback()
+                }
+            }
+            addView(button, 0)
+            buttonToApproximateZoomRatio[button] = AUX_LENS_ZOOM_RATIO
+            auxButton = button
+        }
         updateButtonsAttributes()
     }
 
@@ -124,6 +153,15 @@ class LensSelectorLayout @JvmOverloads constructor(
     }
 
     private fun updateButtonsAttributes() {
+        auxButton?.let { updateButtonAttributes(it, auxLensActive) }
+        if (auxLensActive) {
+            buttonToApproximateZoomRatio.keys.forEach { button ->
+                if (button != auxButton) updateButtonAttributes(button, false)
+            }
+            return
+        }
+        if (!::activeCamera.isInitialized) return
+
         if (usesLogicalZoomRatio) {
             buttonToZoomRatio.asSequence().let {
                 val firstButton = it.first().key
@@ -172,9 +210,10 @@ class LensSelectorLayout @JvmOverloads constructor(
         }
 
     companion object {
+        private const val AUX_LENS_ZOOM_RATIO = 0.6f
         private val DECIMAL_FORMAT_SYMBOLS = DecimalFormatSymbols(Locale.US)
 
         private val ZOOM_RATIO_FORMATTER = DecimalFormat("0.#", DECIMAL_FORMAT_SYMBOLS)
-        private val ZOOM_RATIO_FORMATTER_SUB_ONE = DecimalFormat(".#", DECIMAL_FORMAT_SYMBOLS)
+        private val ZOOM_RATIO_FORMATTER_SUB_ONE = DecimalFormat("0.#", DECIMAL_FORMAT_SYMBOLS)
     }
 }

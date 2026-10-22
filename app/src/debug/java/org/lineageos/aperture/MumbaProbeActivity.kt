@@ -41,6 +41,7 @@ class MumbaProbeActivity : Activity() {
         append("Mumba camera probe\n")
         try {
             probe()
+            printEncoders()
         } catch (t: Throwable) {
             append("FATAL: ${t.stackTraceToString()}\n")
         }
@@ -64,6 +65,9 @@ class MumbaProbeActivity : Activity() {
             return
         }
         append("camera=$id")
+        append("sensor pixel array=${chars.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)}")
+        append("sensor active array=${chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)}")
+        printVendorValues(chars)
         printSizes("JPEG", map.getOutputSizes(ImageFormat.JPEG))
         printSizes("JPEG high-res", map.getHighResolutionOutputSizes(ImageFormat.JPEG))
         printSizes("PRIVATE", map.getOutputSizes(ImageFormat.PRIVATE))
@@ -154,8 +158,43 @@ class MumbaProbeActivity : Activity() {
         }, 5000)
     }
 
+
+    private fun printEncoders() {
+        val list = android.media.MediaCodecList(android.media.MediaCodecList.ALL_CODECS)
+        for (info in list.codecInfos) {
+            if (!info.isEncoder || info.supportedTypes.none { it.equals("video/hevc", true) }) continue
+            append("encoder ${info.name}")
+            try {
+                val caps = info.getCapabilitiesForType("video/hevc")
+                for (pl in caps.profileLevels) {
+                    append("  profile=${pl.profile} level=${pl.level}")
+                }
+                append("  colorFormats=${caps.colorFormats.joinToString()}")
+            } catch (t: Throwable) {
+                append("  capabilities failed: ${t.message}")
+            }
+        }
+    }
+
     private fun printSizes(label: String, sizes: Array<android.util.Size>?) {
         append("$label: ${sizes?.joinToString { "${it.width}x${it.height}" }}")
+    }
+
+    private fun printVendorValues(chars: CameraCharacteristics) {
+        val interesting = chars.keys.filter {
+            val n = it.name.lowercase()
+            n.contains("quadra") || n.contains("remosaic") || n.contains("high_resolution") ||
+                n.contains("sensor_mode") || n.contains("mfnr") || n.contains("super_res")
+        }
+        for (key in interesting) {
+            try {
+                @Suppress("UNCHECKED_CAST")
+                val value = chars.get(key as CameraCharacteristics.Key<Any>)
+                append("char ${key.name}=${value?.toString() ?: "null"}")
+            } catch (t: Throwable) {
+                append("char ${key.name}=ERR ${t.message}")
+            }
+        }
     }
 
     private fun appendVendorTags(chars: CameraCharacteristics) {

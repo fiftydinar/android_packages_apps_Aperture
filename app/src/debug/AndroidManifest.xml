@@ -7,5 +7,11 @@
         <activity
             android:name=".MumbaVideoProbeActivity"
             android:exported="true" />
+        <activity
+            android:name=".MumbaHdrProbeActivity"
+            android:exported="true" />
+        <activity
+            android:name=".Mumba50ProbeActivity"
+            android:exported="true" />
     </application>
 </manifest>

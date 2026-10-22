@@ -13,6 +13,8 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
 import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
@@ -59,6 +61,32 @@ class MumbaHighSpeedEngine(private val context: Context) {
     private var generation = 0
     private var warmUpNeeded = false
     private var warmingUp = false
+    private var warmRecorder: MediaRecorder? = null
+    private var warmFile: File? = null
+    private var warmSession: CameraCaptureSession? = null
+    private var warmStableFrames = 0
+    private val warmStableFramesNeeded = 12
+    private val warmMaxDurationMs = 1500L
+    private val warmFinish = Runnable { finishWarmUp() }
+
+    private val warmProbe = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            s: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult,
+        ) {
+            if (!warmingUp) return
+            val ae = result.get(CaptureResult.CONTROL_AE_STATE)
+            val awb = result.get(CaptureResult.CONTROL_AWB_STATE)
+            val af = result.get(CaptureResult.CONTROL_AF_STATE)
+            val converged = ae == CaptureResult.CONTROL_AE_STATE_CONVERGED &&
+                awb == CaptureResult.CONTROL_AWB_STATE_CONVERGED &&
+                (af == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
+                    af == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED)
+            warmStableFrames = if (converged) warmStableFrames + 1 else 0
+            if (warmStableFrames == warmStableFramesNeeded) handler.post(warmFinish)
+        }
+    }
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -157,6 +185,10 @@ class MumbaHighSpeedEngine(private val context: Context) {
 
     private fun startPreview() {
         val device = camera ?: return
+        if (warmUpNeeded) {
+            warmUp()
+            return
+        }
         val gen = generation
         try { session?.close() } catch (_: Throwable) {}
         val surface = ensurePreviewSurface() ?: return
@@ -175,9 +207,6 @@ class MumbaHighSpeedEngine(private val context: Context) {
                                 setFpsRange(device, this)
                             }
                             hs.setRepeatingBurst(hs.createHighSpeedRequestList(request.build()), null, handler)
-                            if (warmUpNeeded && !warmingUp) {
-                                handler.postDelayed({ warmUp() }, 100)
-                            }
                         } catch (t: Throwable) {
                             if (gen == generation) listener?.onError("preview failed: ${t.message}")
                         }
@@ -220,6 +249,9 @@ class MumbaHighSpeedEngine(private val context: Context) {
         val device = camera ?: return
         if (warmingUp || recording) return
         warmingUp = true
+        warmUpNeeded = false
+        warmStableFrames = 0
+        val gen = generation
         val file = File(context.cacheDir, "mumba-warmup.mp4").apply { delete() }
         val rec = try {
             MediaRecorder().apply {
@@ -238,67 +270,68 @@ class MumbaHighSpeedEngine(private val context: Context) {
             }
         } catch (t: Throwable) {
             Log.w(tag, "warmup prepare failed", t)
-            warmingUp = false
-            warmUpNeeded = false
             file.delete()
+            warmingUp = false
             startPreview()
             return
         }
-        try { session?.stopRepeating() } catch (_: Throwable) {}
-        try { session?.close() } catch (_: Throwable) {}
-        session = null
+        warmRecorder = rec
+        warmFile = file
+        val preview = ensurePreviewSurface()
         try {
             device.createConstrainedHighSpeedCaptureSession(
-                listOfNotNull(ensurePreviewSurface(), rec.surface),
+                listOfNotNull(preview, rec.surface),
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(s: CameraCaptureSession) {
+                        if (gen != generation || !warmingUp) {
+                            try { s.close() } catch (_: Throwable) {}
+                            return
+                        }
+                        warmSession = s
                         try {
                             val hs = s as android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
                             val request = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                                 addTarget(rec.surface)
-                                previewSurface?.let { addTarget(it) }
+                                preview?.let { addTarget(it) }
                                 applyCommonOptions(this)
                                 setFpsRange(device, this)
                             }
-                            hs.setRepeatingBurst(hs.createHighSpeedRequestList(request.build()), null, handler)
+                            hs.setRepeatingBurst(hs.createHighSpeedRequestList(request.build()), warmProbe, handler)
                             rec.start()
-                            handler.postDelayed({
-                                try { hs.stopRepeating() } catch (_: Throwable) {}
-                                try { rec.stop() } catch (_: Throwable) {}
-                                try { rec.release() } catch (_: Throwable) {}
-                                try { s.close() } catch (_: Throwable) {}
-                                file.delete()
-                                warmingUp = false
-                                warmUpNeeded = false
-                                startPreview()
-                            }, 1500)
+                            handler.postDelayed(warmFinish, warmMaxDurationMs)
                         } catch (t: Throwable) {
-                            Log.w(tag, "warmup configure failed", t)
-                            try { rec.release() } catch (_: Throwable) {}
-                            file.delete()
-                            warmingUp = false
-                            warmUpNeeded = false
-                            startPreview()
+                            Log.w(tag, "warmup start failed", t)
+                            finishWarmUp()
                         }
                     }
 
                     override fun onConfigureFailed(s: CameraCaptureSession) {
                         Log.w(tag, "warmup session failed")
-                        try { rec.release() } catch (_: Throwable) {}
-                        file.delete()
-                        warmingUp = false
-                        warmUpNeeded = false
-                        startPreview()
+                        finishWarmUp()
                     }
-                }, handler
+                },
+                handler,
             )
         } catch (t: Throwable) {
-            try { rec.release() } catch (_: Throwable) {}
-            file.delete()
-            warmingUp = false
-            warmUpNeeded = false
-            startPreview()
+            Log.w(tag, "warmup session creation failed", t)
+            finishWarmUp()
         }
+    }
+
+    private fun finishWarmUp() {
+        if (!warmingUp) return
+        warmingUp = false
+        handler.removeCallbacks(warmFinish)
+        try { warmSession?.stopRepeating() } catch (_: Throwable) {}
+        try { warmRecorder?.stop() } catch (_: Throwable) {}
+        try { warmRecorder?.release() } catch (_: Throwable) {}
+        warmRecorder = null
+        try { warmSession?.close() } catch (_: Throwable) {}
+        warmSession = null
+        warmFile?.delete()
+        warmFile = null
+        warmStableFrames = 0
+        startPreview()
     }
 
     fun startRecording() {
@@ -418,6 +451,14 @@ class MumbaHighSpeedEngine(private val context: Context) {
         generation++
         warmUpNeeded = false
         warmingUp = false
+        handler.removeCallbacks(warmFinish)
+        warmStableFrames = 0
+        try { warmSession?.close() } catch (_: Throwable) {}
+        warmSession = null
+        try { warmRecorder?.release() } catch (_: Throwable) {}
+        warmRecorder = null
+        warmFile?.delete()
+        warmFile = null
         if (recording) {
             recording = false
             handler.removeCallbacks(ticker)

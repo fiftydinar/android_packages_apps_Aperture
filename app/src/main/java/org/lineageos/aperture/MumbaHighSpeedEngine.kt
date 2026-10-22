@@ -134,28 +134,41 @@ class MumbaHighSpeedEngine(private val context: Context) {
         val surface = previewSurface ?: return
         try { session?.close() } catch (_: Throwable) {}
         try {
-            device.createCaptureSession(listOf(surface), object : CameraCaptureSession.StateCallback() {
-                override fun onConfigured(s: CameraCaptureSession) {
-                    session = s
-                    try {
-                        val request = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                            addTarget(surface)
-                            set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+            device.createConstrainedHighSpeedCaptureSession(
+                listOf(surface),
+                object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(s: CameraCaptureSession) {
+                        session = s
+                        try {
+                            val hs = s as android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
+                            val request = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                                addTarget(surface)
+                                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                                setFpsRange(device, this)
+                            }
+                            hs.setRepeatingBurst(hs.createHighSpeedRequestList(request.build()), null, handler)
+                        } catch (t: Throwable) {
+                            listener?.onError("preview failed: ${t.message}")
                         }
-                        s.setRepeatingRequest(request.build(), null, handler)
-                    } catch (t: Throwable) {
-                        listener?.onError("preview failed: ${t.message}")
                     }
-                }
 
-                override fun onConfigureFailed(s: CameraCaptureSession) {
-                    listener?.onError("preview configure failed")
-                }
-            }, handler)
+                    override fun onConfigureFailed(s: CameraCaptureSession) {
+                        listener?.onError("preview configure failed")
+                    }
+                }, handler
+            )
         } catch (t: Throwable) {
             listener?.onError("preview session failed: ${t.message}")
         }
+    }
+
+    private fun setFpsRange(device: CameraDevice, builder: CaptureRequest.Builder) {
+        val ranges = device.cameraCharacteristics()
+            ?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?.getHighSpeedVideoFpsRangesFor(Size(1280, 720))
+        ranges?.firstOrNull { it.upper == 120 && it.lower == 120 }
+            ?.let { builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
     }
 
     fun startRecording() {
@@ -208,13 +221,10 @@ class MumbaHighSpeedEngine(private val context: Context) {
                     val hs = s as android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
                     val request = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                         addTarget(rec.surface)
+                        previewSurface?.let { addTarget(it) }
                         set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                         set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
-                        val ranges = device.cameraCharacteristics()
-                            ?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                            ?.getHighSpeedVideoFpsRangesFor(Size(1280, 720))
-                        ranges?.firstOrNull { it.upper == 120 && it.lower == 120 }
-                            ?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+                        setFpsRange(device, this)
                     }
                     hs.setRepeatingBurst(hs.createHighSpeedRequestList(request.build()), null, handler)
                     rec.start()
@@ -240,7 +250,8 @@ class MumbaHighSpeedEngine(private val context: Context) {
         }
 
         try {
-            device.createConstrainedHighSpeedCaptureSession(listOf(rec.surface), callback, handler)
+            val surfaces = listOfNotNull(previewSurface, rec.surface)
+            device.createConstrainedHighSpeedCaptureSession(surfaces, callback, handler)
         } catch (t: Throwable) {
             releaseRecorder()
             discardOutput(output)

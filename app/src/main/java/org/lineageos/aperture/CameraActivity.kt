@@ -1735,6 +1735,11 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                     "Video dynamic range not supported with the requested video quality"
                 }
 
+                cameraConfiguration.videoFrameRate?.let {
+                    viewModel.cameraController.videoCaptureTargetFrameRate =
+                        Range(it.value, it.value)
+                }
+
                 // Set the quality
                 viewModel.cameraController.videoCaptureQualitySelector =
                     QualitySelector.from(cameraConfiguration.videoQuality)

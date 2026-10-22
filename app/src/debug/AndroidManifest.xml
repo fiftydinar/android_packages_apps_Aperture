@@ -16,5 +16,8 @@
         <activity
             android:name=".MumbaSwHevcProbeActivity"
             android:exported="true" />
+        <activity
+            android:name=".MumbaQcfaReprocProbeActivity"
+            android:exported="true" />
     </application>
 </manifest>

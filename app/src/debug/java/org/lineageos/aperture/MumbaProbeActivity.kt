@@ -73,6 +73,10 @@ class MumbaProbeActivity : Activity() {
         printSizes("JPEG high-res", map.getHighResolutionOutputSizes(ImageFormat.JPEG))
         printSizes("PRIVATE", map.getOutputSizes(ImageFormat.PRIVATE))
         printSizes("P010", map.getOutputSizes(ImageFormat.YCBCR_P010))
+        printSizes("RAW10", map.getOutputSizes(ImageFormat.RAW10))
+        printSizes("RAW_SENSOR", map.getOutputSizes(ImageFormat.RAW_SENSOR))
+        printSizes("RAW_PRIVATE", map.getOutputSizes(ImageFormat.RAW_PRIVATE))
+        append("reprocess max stall=${chars.get(CameraCharacteristics.REPROCESS_MAX_CAPTURE_STALL)}")
         printSizes("video", map.getOutputSizes(android.media.MediaRecorder::class.java))
         append("high-speed sizes=${map.highSpeedVideoSizes?.joinToString()}")
         for (size in map.highSpeedVideoSizes.orEmpty()) {

@@ -36,6 +36,7 @@ import org.lineageos.aperture.models.Preference.Companion.enumPreference
 import org.lineageos.aperture.models.Preference.Companion.primitivePreference
 import org.lineageos.aperture.models.ShadingMode
 import org.lineageos.aperture.models.TimerMode
+import org.lineageos.aperture.models.VideoCodec
 import org.lineageos.aperture.models.VideoDynamicRange
 import org.lineageos.aperture.models.VideoMirrorMode
 
@@ -228,6 +229,18 @@ class PreferencesRepository(
         key = "video_framerate",
         defaultValue = null,
         enumMapper = { it: FrameRate? -> it?.value },
+    ).asPreferenceHolder()
+
+    /**
+     * Desired [VideoCodec] for videos.
+     */
+    val videoCodec = enumPreference(
+        key = "video_codec",
+        defaultValue = VideoCodec.HEVC,
+        enumToPreferenceValue = mapOf(
+            VideoCodec.H264 to "h264",
+            VideoCodec.HEVC to "hevc",
+        ),
     ).asPreferenceHolder()
 
     /**

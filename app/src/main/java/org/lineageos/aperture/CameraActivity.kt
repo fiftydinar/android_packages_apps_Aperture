@@ -1474,7 +1474,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
             }
             val recorder = Recorder.Builder()
                 .setQualitySelector(QualitySelector.from(quality))
-                .setVideoMimeType("video/hevc")
+                .setVideoMimeType(viewModel.videoCodecMime)
                 .setTargetVideoEncodingBitRate(bitrate)
                 .setTargetAudioEncodingBitRate(256_000)
                 .setTargetAudioChannelCount(2)

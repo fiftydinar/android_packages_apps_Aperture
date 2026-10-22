@@ -107,6 +107,15 @@
             app:title="@string/video_stabilization_title" />
 
         <ListPreference
+            app:defaultValue="hevc"
+            app:entries="@array/video_codec_entries"
+            app:entryValues="@array/video_codec_values"
+            app:iconSpaceReserved="false"
+            app:key="video_codec"
+            app:title="@string/video_codec_title"
+            app:useSimpleSummaryProvider="true" />
+
+        <ListPreference
             app:defaultValue="off"
             app:entries="@array/video_mirror_mode_entries"
             app:entryValues="@array/video_mirror_mode_values"

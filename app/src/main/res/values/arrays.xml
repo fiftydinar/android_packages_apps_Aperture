@@ -176,6 +176,16 @@
     </string-array>
 
     <!-- Video mirror mode preference -->
+    <string-array name="video_codec_entries" translatable="false">
+        <item>H.264 (AVC)</item>
+        <item>HEVC (H.265)</item>
+    </string-array>
+
+    <string-array name="video_codec_values" translatable="false">
+        <item>h264</item>
+        <item>hevc</item>
+    </string-array>
+
     <string-array name="video_mirror_mode_entries" translatable="false">
         <item>@string/video_mirror_mode_off</item>
         <item>@string/video_mirror_mode_on</item>

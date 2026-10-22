@@ -89,6 +89,7 @@ import org.lineageos.aperture.models.Rotation
 import org.lineageos.aperture.models.ShadingMode
 import org.lineageos.aperture.models.ThermalStatus
 import org.lineageos.aperture.models.TimerMode
+import org.lineageos.aperture.models.VideoCodec
 import org.lineageos.aperture.models.VideoDynamicRange
 import org.lineageos.aperture.models.VideoQualityInfo
 import org.lineageos.aperture.qr.QrImageAnalyzer
@@ -790,6 +791,12 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
     }
 
     /**
+     * Video codec MIME type.
+     */
+    val videoCodecMime: String
+        get() = preferencesRepository.videoCodec.value.mimeType
+
+    /**
      * Video mic mode.
      */
     val videoMicMode = MutableStateFlow(preferencesRepository.videoMicMode.value)
@@ -954,6 +961,7 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
                     preferencesRepository.disableJpegWithRaw,
                     preferencesRepository.videoStabilization,
                     preferencesRepository.videoMirrorMode,
+                    preferencesRepository.videoCodec,
                     preferencesRepository.edgeMode,
                     preferencesRepository.noiseReductionMode,
                     preferencesRepository.shadingMode,

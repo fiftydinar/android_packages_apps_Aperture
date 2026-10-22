@@ -150,6 +150,7 @@
     <string name="video_stabilization_title">Enable video stabilization</string>
     <string name="video_stabilization_summary">When available, enable video stabilization to reduce camera vibrations during recording</string>
     <string name="video_mirror_mode_title">Enable video mirroring</string>
+    <string name="video_codec_title">Video codec</string>
 
     <!-- Advanced Preferences -->
     <string name="processing_title">Processing</string>

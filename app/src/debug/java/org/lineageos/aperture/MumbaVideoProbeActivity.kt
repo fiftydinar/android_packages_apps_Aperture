@@ -38,12 +38,13 @@ class MumbaVideoProbeActivity : Activity() {
     private val seconds by lazy { intent.getIntExtra("seconds", 5) }
     private val useHevc by lazy { intent.getStringExtra("codec") != "avc" }
     private val useEis by lazy { intent.getBooleanExtra("eis", true) }
+    private val hdrMode by lazy { intent.getIntExtra("hdr", 0) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         textView = TextView(this).apply { textSize = 11f; setPadding(24, 24, 24, 24) }
         setContentView(ScrollView(this).apply { addView(textView) })
-        append("Mumba video probe ${width}x$height@$fps codec=${if (useHevc) "hevc" else "avc"} eis=$useEis")
+        append("Mumba video probe ${width}x$height@$fps codec=${if (useHevc) "hevc" else "avc"} eis=$useEis hdr=$hdrMode")
         try {
             start()
         } catch (t: Throwable) {
@@ -88,7 +89,7 @@ class MumbaVideoProbeActivity : Activity() {
                 camera = device
                 opened[0] = true
                 append("camera opened")
-                device.createCaptureSession(listOf(recorder!!.surface), object : CameraCaptureSession.StateCallback() {
+                val callback = object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(s: CameraCaptureSession) {
                         session = s
                         try {
@@ -96,16 +97,46 @@ class MumbaVideoProbeActivity : Activity() {
                                 addTarget(recorder!!.surface)
                                 set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
-                                val ranges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                                val ranges = if (fps >= 120) {
+                                    map.getHighSpeedVideoFpsRangesFor(android.util.Size(width, height))
+                                } else {
+                                    chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                                }
                                 val range = ranges?.firstOrNull { it.lower == fps && it.upper == fps }
-                                    ?: ranges?.firstOrNull { it.contains(fps) }
+                                    ?: ranges?.firstOrNull { it.upper == fps }
                                 if (range != null) set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
                                 val stab = chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
-                                if (useEis && stab?.contains(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true) {
+                                if (useEis && fps <= 60 && stab?.contains(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true) {
                                     set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
                                 }
+                                if (hdrMode > 0) {
+                                    val key = availableKey(chars, "org.codeaurora.qcamera3.sessionParameters.HDRVideoMode")
+                                    if (key != null) {
+                                        append("setting HDR key=$key value=$hdrMode")
+                                        try {
+                                            @Suppress("UNCHECKED_CAST")
+                                            set(key as CaptureRequest.Key<IntArray>, intArrayOf(hdrMode))
+                                        } catch (t: Throwable) {
+                                            append("HDR int[] set failed: ${t.message}")
+                                            try {
+                                                @Suppress("UNCHECKED_CAST")
+                                                set(key as CaptureRequest.Key<ByteArray>, byteArrayOf(hdrMode.toByte()))
+                                            } catch (t2: Throwable) {
+                                                append("HDR byte[] set failed: ${t2.message}")
+                                            }
+                                        }
+                                    } else {
+                                        append("HDR key not found")
+                                    }
+                                }
                             }
-                            s.setRepeatingRequest(request.build(), null, null)
+                            if (fps >= 120) {
+                                val hs = s as android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
+                                val burst = hs.createHighSpeedRequestList(request.build())
+                                hs.setRepeatingBurst(burst, null, null)
+                            } else {
+                                s.setRepeatingRequest(request.build(), null, null)
+                            }
                             recorder!!.start()
                             append("recording for ${seconds}s")
                             Handler(Looper.getMainLooper()).postDelayed({ stop() }, seconds * 1000L)
@@ -115,7 +146,12 @@ class MumbaVideoProbeActivity : Activity() {
                     }
 
                     override fun onConfigureFailed(s: CameraCaptureSession) = append("configure FAILED")
-                }, null)
+                }
+                if (fps >= 120) {
+                    device.createConstrainedHighSpeedCaptureSession(listOf(recorder!!.surface), callback, null)
+                } else {
+                    device.createCaptureSession(listOf(recorder!!.surface), callback, null)
+                }
             }
 
             override fun onDisconnected(device: CameraDevice) = append("disconnected")
@@ -125,6 +161,13 @@ class MumbaVideoProbeActivity : Activity() {
             if (opened[0] != true) append("open timeout")
         }, 5000)
     }
+
+
+    private fun availableKey(
+        chars: CameraCharacteristics,
+        name: String,
+    ): CaptureRequest.Key<*>? = (chars.availableSessionKeys.orEmpty() +
+            chars.availableCaptureRequestKeys.orEmpty()).firstOrNull { it.name == name }
 
     private fun stop() {
         try { session?.stopRepeating() } catch (_: Throwable) {}

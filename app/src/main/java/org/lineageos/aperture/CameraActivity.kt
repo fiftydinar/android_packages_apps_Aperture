@@ -122,6 +122,7 @@ import org.lineageos.aperture.models.PhotoOutputFormat
 import org.lineageos.aperture.models.Rotation
 import org.lineageos.aperture.models.ThermalStatus
 import org.lineageos.aperture.models.TimerMode
+import org.lineageos.aperture.models.VideoCodec
 import org.lineageos.aperture.models.VideoDynamicRange
 import org.lineageos.aperture.models.VideoMirrorMode
 import org.lineageos.aperture.models.VideoStabilizationMode
@@ -1464,13 +1465,22 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
     private fun installCustomVideoCapture(cameraConfiguration: CameraConfiguration.Video) {
         try {
             val quality = cameraConfiguration.videoQuality
-            val bitrate = when (quality) {
-                Quality.QHD -> 50_000_000
-                Quality.FHD -> 40_000_000
-                Quality.HD -> 20_000_000
-                Quality.SD -> 10_000_000
-                Quality.UHD -> 60_000_000
-                else -> 30_000_000
+            val fps = cameraConfiguration.videoFrameRate?.value ?: 30
+            val bitrate = if (
+                viewModel.videoCodecMime == VideoCodec.HEVC.mimeType &&
+                quality == Quality.FHD &&
+                fps >= 60
+            ) {
+                80_000_000
+            } else {
+                when (quality) {
+                    Quality.QHD -> 50_000_000
+                    Quality.FHD -> 40_000_000
+                    Quality.HD -> 20_000_000
+                    Quality.SD -> 10_000_000
+                    Quality.UHD -> 60_000_000
+                    else -> 30_000_000
+                }
             }
             val recorder = Recorder.Builder()
                 .setQualitySelector(QualitySelector.from(quality))

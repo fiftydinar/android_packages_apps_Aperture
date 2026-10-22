@@ -4,5 +4,8 @@
         <activity
             android:name=".MumbaProbeActivity"
             android:exported="true" />
+        <activity
+            android:name=".MumbaVideoProbeActivity"
+            android:exported="true" />
     </application>
 </manifest>

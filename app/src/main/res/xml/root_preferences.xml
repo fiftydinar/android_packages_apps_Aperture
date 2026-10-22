@@ -107,7 +107,7 @@
             app:title="@string/video_stabilization_title" />
 
         <ListPreference
-            app:defaultValue="hevc"
+            app:defaultValue="h264"
             app:entries="@array/video_codec_entries"
             app:entryValues="@array/video_codec_values"
             app:iconSpaceReserved="false"

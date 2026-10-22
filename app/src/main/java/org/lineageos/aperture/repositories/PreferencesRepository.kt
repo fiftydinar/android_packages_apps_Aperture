@@ -236,7 +236,7 @@ class PreferencesRepository(
      */
     val videoCodec = enumPreference(
         key = "video_codec",
-        defaultValue = VideoCodec.HEVC,
+        defaultValue = VideoCodec.H264,
         enumToPreferenceValue = mapOf(
             VideoCodec.H264 to "h264",
             VideoCodec.HEVC to "hevc",

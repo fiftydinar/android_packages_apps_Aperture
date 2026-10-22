@@ -15,6 +15,7 @@ enum class VideoDynamicRange(
     val dynamicRange: DynamicRange,
 ) {
     SDR(DynamicRange.SDR),
+    HLG_8_BIT(DynamicRange.SDR),
     HLG_10_BIT(DynamicRange.HLG_10_BIT),
     HDR10_10_BIT(DynamicRange.HDR10_10_BIT),
     HDR10_PLUS_10_BIT(DynamicRange.HDR10_PLUS_10_BIT),

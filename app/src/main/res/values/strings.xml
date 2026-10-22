@@ -31,6 +31,7 @@
     <string name="video_quality_sd" translatable="false">480p</string>
     <string name="video_quality_hd" translatable="false">720p</string>
     <string name="video_quality_fhd" translatable="false">1080p</string>
+    <string name="video_quality_qhd" translatable="false">1440p</string>
     <string name="video_quality_uhd" translatable="false">2160p</string>
 
     <string name="video_framerate_auto">AUTO FPS</string>
@@ -241,6 +242,7 @@
 
     <!-- Video dynamic ranges -->
     <string name="video_dynamic_range_sdr" translatable="false">SDR</string>
+    <string name="video_dynamic_range_hlg_8_bit" translatable="false">HLG (8-bit)</string>
     <string name="video_dynamic_range_hlg_10_bit" translatable="false">HLG (10 bit)</string>
     <string name="video_dynamic_range_hdr10_10_bit" translatable="false">HDR10 (10 bit)</string>
     <string name="video_dynamic_range_hdr10_plus_10_bit" translatable="false">HDR10+ (10 bit)</string>

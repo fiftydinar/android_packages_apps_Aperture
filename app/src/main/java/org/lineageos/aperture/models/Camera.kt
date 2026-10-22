@@ -98,7 +98,7 @@ class Camera private constructor(
         videoCapabilities.getSupportedQualities(it.dynamicRange)
     }
 
-    val supportedVideoQualities =
+    val supportedVideoQualities: Map<Quality, VideoQualityInfo> =
         videoQualityForDynamicRanges.values.flatten().toSet().associateWith {
             VideoQualityInfo(
                 it,
@@ -115,6 +115,29 @@ class Camera private constructor(
                     dynamicRangeToQualities.value.contains(it)
                 }.map { dynamicRangeToQualities -> dynamicRangeToQualities.key }.toSet()
             )
+        }.toMutableMap().apply {
+            if (cameraFacing == CameraFacing.BACK) {
+                for (quality in listOf(Quality.HD, Quality.FHD)) {
+                    get(quality)?.let {
+                        put(
+                            quality,
+                            it.copy(
+                                supportedDynamicRanges = it.supportedDynamicRanges +
+                                        VideoDynamicRange.HLG_8_BIT
+                            )
+                        )
+                    }
+                }
+                putIfAbsent(
+                    Quality.QHD,
+                    VideoQualityInfo(
+                        Quality.QHD,
+                        supportedVideoFrameRates.filter { it.value <= 30 }.toSet()
+                            .ifEmpty { setOf(FrameRate.FPS_24, FrameRate.FPS_30) },
+                        setOf(VideoDynamicRange.SDR, VideoDynamicRange.HLG_8_BIT),
+                    )
+                )
+            }
         }
 
     val supportedVideoStabilizationModes = buildList {

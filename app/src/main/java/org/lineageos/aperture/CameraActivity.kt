@@ -24,6 +24,7 @@ import android.os.Looper
 import android.os.Message
 import android.provider.MediaStore
 import android.util.Log
+import android.util.Range
 import android.view.GestureDetector
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -37,6 +38,8 @@ import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
+import android.hardware.camera2.CaptureRequest
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.AspectRatio
@@ -48,6 +51,8 @@ import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.extensions.ExtensionMode
 import androidx.camera.video.Quality
 import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.VideoCapture
 import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.CameraController
 import androidx.camera.view.PreviewView
@@ -1212,6 +1217,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                         Quality.SD -> R.drawable.ic_sd
                         Quality.HD -> R.drawable.ic_hd
                         Quality.FHD -> R.drawable.ic_full_hd
+                        Quality.QHD -> R.drawable.ic_full_hd
                         Quality.UHD -> R.drawable.ic_4k
                         else -> throw Exception("Unknown video quality $videoQuality")
                     },
@@ -1223,6 +1229,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                         Quality.SD -> R.string.video_quality_sd
                         Quality.HD -> R.string.video_quality_hd
                         Quality.FHD -> R.string.video_quality_fhd
+                        Quality.QHD -> R.string.video_quality_qhd
                         Quality.UHD -> R.string.video_quality_uhd
                         else -> throw Exception("Unknown video quality $videoQuality")
                     }
@@ -1258,6 +1265,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                     0,
                     when (videoDynamicRange) {
                         VideoDynamicRange.SDR -> R.drawable.ic_hdr_off
+                        VideoDynamicRange.HLG_8_BIT -> R.drawable.ic_hdr_on
                         VideoDynamicRange.HLG_10_BIT -> R.drawable.ic_hdr_on
                         VideoDynamicRange.HDR10_10_BIT -> R.drawable.ic_hdr_on
                         VideoDynamicRange.HDR10_PLUS_10_BIT -> R.drawable.ic_hdr_on
@@ -1270,6 +1278,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                 videoDynamicRangeButton.setText(
                     when (videoDynamicRange) {
                         VideoDynamicRange.SDR -> R.string.video_dynamic_range_sdr
+                        VideoDynamicRange.HLG_8_BIT -> R.string.video_dynamic_range_hlg_8_bit
                         VideoDynamicRange.HLG_10_BIT -> R.string.video_dynamic_range_hlg_10_bit
                         VideoDynamicRange.HDR10_10_BIT -> R.string.video_dynamic_range_hdr10_10_bit
                         VideoDynamicRange.HDR10_PLUS_10_BIT -> R.string.video_dynamic_range_hdr10_plus_10_bit
@@ -1452,6 +1461,64 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         }
     }
 
+    private fun installCustomVideoCapture(cameraConfiguration: CameraConfiguration.Video) {
+        try {
+            val quality = cameraConfiguration.videoQuality
+            val bitrate = when (quality) {
+                Quality.QHD -> 50_000_000
+                Quality.FHD -> 40_000_000
+                Quality.HD -> 20_000_000
+                Quality.SD -> 10_000_000
+                Quality.UHD -> 60_000_000
+                else -> 30_000_000
+            }
+            val recorder = Recorder.Builder()
+                .setQualitySelector(QualitySelector.from(quality))
+                .setVideoMimeType("video/hevc")
+                .setTargetVideoEncodingBitRate(bitrate)
+                .setTargetAudioEncodingBitRate(256_000)
+                .setTargetAudioChannelCount(2)
+                .build()
+            val builder = VideoCapture.Builder<Recorder>(recorder)
+                .setDynamicRange(cameraConfiguration.videoDynamicRange.dynamicRange)
+            cameraConfiguration.videoFrameRate?.let {
+                builder.setTargetFrameRate(Range(it.value, it.value))
+            }
+            if (cameraConfiguration.videoDynamicRange == VideoDynamicRange.HLG_8_BIT) {
+                try {
+                    val ctor = CaptureRequest.Key::class.java.getDeclaredConstructor(
+                        String::class.java, Class::class.java
+                    )
+                    ctor.isAccessible = true
+                    @Suppress("UNCHECKED_CAST")
+                    val key = ctor.newInstance(
+                        "org.codeaurora.qcamera3.sessionParameters.HDRVideoMode",
+                        IntArray::class.java
+                    ) as CaptureRequest.Key<IntArray>
+                    Camera2Interop.Extender(builder).setCaptureRequestOption(key, intArrayOf(1))
+                } catch (t: Throwable) {
+                    Log.w(LOG_TAG, "Failed to set HLG vendor key", t)
+                }
+            }
+            val videoCapture = builder.build()
+            var clazz: Class<*>? = viewModel.cameraController.javaClass
+            var field: java.lang.reflect.Field? = null
+            while (clazz != null && field == null) {
+                field = try {
+                    clazz.getDeclaredField("mVideoCapture")
+                } catch (_: NoSuchFieldException) {
+                    null
+                }
+                clazz = clazz.superclass
+            }
+            if (field == null) throw NoSuchFieldException("mVideoCapture")
+            field.isAccessible = true
+            field.set(viewModel.cameraController, videoCapture)
+        } catch (t: Throwable) {
+            Log.w(LOG_TAG, "Failed to install custom video capture", t)
+        }
+    }
+
     /**
      * Rebind cameraProvider use cases
      */
@@ -1611,6 +1678,12 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         viewModel.cameraController.cameraSelector = cameraSelector
         viewModel.cameraController.setEnabledUseCases(cameraUseCases)
 
+        // Use a custom Recorder for Mumba video modes so that we can set stereo audio,
+        // a higher video bitrate and the requested quality.
+        if (cameraConfiguration is CameraConfiguration.Video) {
+            installCustomVideoCapture(cameraConfiguration)
+        }
+
         // Bind camera controller to lifecycle
         viewModel.cameraController.bindToLifecycle(this)
 
@@ -1635,11 +1708,14 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                 )
                 .setVideoStabilizationMode(
                     when (cameraConfiguration) {
-                        is CameraConfiguration.Video -> when (
-                            cameraConfiguration.enableVideoStabilization
-                        ) {
-                            true -> VideoStabilizationMode.getMode(cameraConfiguration.camera)
-                            false -> null
+                        is CameraConfiguration.Video -> when {
+                            cameraConfiguration.videoDynamicRange ==
+                                    VideoDynamicRange.HLG_8_BIT -> null
+
+                            cameraConfiguration.enableVideoStabilization ->
+                                VideoStabilizationMode.getMode(cameraConfiguration.camera)
+
+                            else -> null
                         }
 
                         else -> null

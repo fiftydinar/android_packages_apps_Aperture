@@ -240,6 +240,7 @@ class PreferencesRepository(
             Quality.SD to "sd",
             Quality.HD to "hd",
             Quality.FHD to "fhd",
+            Quality.QHD to "qhd",
             Quality.UHD to "uhd",
         ),
     ).asPreferenceHolder()
@@ -421,6 +422,7 @@ class PreferencesRepository(
         enumMapper = {
             when (it) {
                 VideoDynamicRange.SDR -> "sdr"
+                VideoDynamicRange.HLG_8_BIT -> "hlg_8_bit"
                 VideoDynamicRange.HLG_10_BIT -> "hlg_10_bit"
                 VideoDynamicRange.HDR10_10_BIT -> "hdr10_10_bit"
                 VideoDynamicRange.HDR10_PLUS_10_BIT -> "hdr10_plus_10_bit"

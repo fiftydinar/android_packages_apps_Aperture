@@ -41,7 +41,8 @@ class MumbaCameraXProbeActivity : ComponentActivity() {
     private val seconds by lazy { intent.getIntExtra("seconds", 4) }
     private val videoBitrate by lazy { intent.getIntExtra("vbitrate", 0) }
     private val audioBitrate by lazy { intent.getIntExtra("abitrate", 0) }
-    private val mime by lazy { intent.getStringExtra("mime") ?: "video/hevc" }
+    private val mime by lazy { intent.getStringExtra("mime") ?: "" }
+    private val channels by lazy { intent.getIntExtra("channels", 0) }
     private val qualityName by lazy { intent.getStringExtra("quality") ?: "" }
     private val hdr by lazy { intent.getBooleanExtra("hdr", false) }
 
@@ -49,7 +50,7 @@ class MumbaCameraXProbeActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         textView = TextView(this).apply { textSize = 11f; setPadding(24, 24, 24, 24) }
         setContentView(ScrollView(this).apply { addView(textView) })
-        append("Mumba CameraX probe ${width}x$height@$fps vbr=$videoBitrate abr=$audioBitrate mime=$mime")
+        append("Mumba CameraX probe ${width}x$height@$fps vbr=$videoBitrate abr=$audioBitrate ch=$channels mime=$mime")
         try {
             start()
         } catch (t: Throwable) {
@@ -74,9 +75,10 @@ class MumbaCameraXProbeActivity : ComponentActivity() {
         val selector = QualitySelector.from(quality)
         val recorderBuilder = Recorder.Builder()
             .setQualitySelector(selector)
-            .setVideoMimeType(mime)
+        if (mime.isNotEmpty()) recorderBuilder.setVideoMimeType(mime)
         if (videoBitrate > 0) recorderBuilder.setTargetVideoEncodingBitRate(videoBitrate)
         if (audioBitrate > 0) recorderBuilder.setTargetAudioEncodingBitRate(audioBitrate)
+        if (channels > 0) recorderBuilder.setTargetAudioChannelCount(channels)
         val recorder = recorderBuilder.build()
         val captureBuilder = VideoCapture.Builder<Recorder>(recorder)
             .setTargetFrameRate(Range(fps, fps))

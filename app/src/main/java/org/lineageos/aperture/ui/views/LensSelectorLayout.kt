@@ -210,7 +210,7 @@ class LensSelectorLayout @JvmOverloads constructor(
         }
 
     companion object {
-        private const val AUX_LENS_ZOOM_RATIO = 0.6f
+        private const val AUX_LENS_ZOOM_RATIO = 0.3f
         private val DECIMAL_FORMAT_SYMBOLS = DecimalFormatSymbols(Locale.US)
 
         private val ZOOM_RATIO_FORMATTER = DecimalFormat("0.#", DECIMAL_FORMAT_SYMBOLS)

@@ -64,6 +64,8 @@ class LensRecordingEngine(private val context: Context) {
     private val sessionsClosedCallbacks = mutableListOf<() -> Unit>()
     private val openingIds = mutableSetOf<String>()
     private val cameraCloseCallbacks = mutableMapOf<CameraDevice, () -> Unit>()
+    private val closingCameraIds = mutableSetOf<String>()
+    private val pendingOpenIds = mutableListOf<String>()
     private val inputSurfaces = mutableMapOf<String, Surface>()
     private val configuringSessionIds = mutableSetOf<String>()
 
@@ -77,7 +79,11 @@ class LensRecordingEngine(private val context: Context) {
     private var codecMime = "video/avc"
     private var audioEnabled = true
     private var lensCameraId = CAMERA_MAIN_ID
+    /** Last rear lens chosen by the user; kept while a front/selfie lens is active. */
+    private var rearLensId = CAMERA_MAIN_ID
     private var zoomRatio = 1f
+    private var zoomTarget = 1f
+    private var zoomAnimating = false
     private var exposureCompensation = 0
     private var torchEnabled = false
     private var focusPoint: Pair<Float, Float>? = null
@@ -112,17 +118,30 @@ class LensRecordingEngine(private val context: Context) {
     val currentLensId get() = lensCameraId
     val isUltraWide get() = lensCameraId == CAMERA_ULTRA_WIDE_ID
     val isFrontCamera get() = lensCameraId == CAMERA_FRONT_ID
+    val isRearUltraWideSelected get() = rearLensId == CAMERA_ULTRA_WIDE_ID
+    /** True only when the ultra-wide camera is open and streaming. */
+    val isRearUltraWideReady: Boolean
+        get() = cameras[CAMERA_ULTRA_WIDE_ID] != null && sessions[CAMERA_ULTRA_WIDE_ID] != null
     val isCameraSwitching get() = cameraSwitchInProgress
     val canSwitchCameraDuringRecording: Boolean
-        get() = isRecording && !cameraSwitchInProgress &&
+        get() = isRecording && !cameraSwitchInProgress && activeStreamsReady() &&
                 (isFrontCamera || canSwitchToFront(profile))
     val currentZoomRatio get() = zoomRatio
+    val minimumZoomRatio: Float get() = MIN_ZOOM_RATIO
     val maximumZoomRatio: Float
-        get() = if (isUltraWide) 1f else characteristics(lensCameraId)
-            ?.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.upper ?: 1f
+        get() = characteristics(CAMERA_MAIN_ID)
+            ?.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.upper
+            ?.coerceAtLeast(1f) ?: 1f
     val hasFlashUnit get() = !isUltraWide && characteristics(lensCameraId)
         ?.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
     val isTorchEnabled get() = torchEnabled
+
+    private val zoomAnimator = object : Runnable {
+        override fun run() {
+            if (!stepZoomAnimation()) return
+            mainHandler.postDelayed(this, ZOOM_STEP_INTERVAL_MS)
+        }
+    }
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -165,6 +184,7 @@ class LensRecordingEngine(private val context: Context) {
         generation++
         textureView = view
         lensCameraId = initialLensId.takeIf(::isSupportedLensId) ?: CAMERA_MAIN_ID
+        if (lensCameraId != CAMERA_FRONT_ID) rearLensId = lensCameraId
         activeCameraIds = rearCameraIds
         cameraSwitchInProgress = false
         pendingCameraReadyId = null
@@ -174,6 +194,9 @@ class LensRecordingEngine(private val context: Context) {
         this.listener = listener
         firstFrameCallback = onFirstFrame
         zoomRatio = 1f
+        zoomTarget = 1f
+        zoomAnimating = false
+        mainHandler.removeCallbacks(zoomAnimator)
         exposureCompensation = 0
         torchEnabled = false
         focusPoint = null
@@ -199,7 +222,7 @@ class LensRecordingEngine(private val context: Context) {
         val activeProfile = profile ?: return
         val gen = generation
         val view = textureView ?: return
-        compositor = LensVideoCompositor(
+        val gl = LensVideoCompositor(
             textureView = view,
             initialWidth = activeProfile.width,
             initialHeight = activeProfile.height,
@@ -207,17 +230,26 @@ class LensRecordingEngine(private val context: Context) {
             initialAspectRatio = activeProfile.contentAspectRatio,
             onActiveFrame = { firstFrameCallback?.invoke() },
             onError = { listener?.onError("video compositor failed: ${it.message}") },
-        ).also { gl ->
-            gl.initialize { surfaces ->
-                if (gen != generation || !isAttached) {
-                    gl.release()
-                    return@initialize
-                }
-                inputSurfaces.clear()
-                inputSurfaces.putAll(surfaces)
-                openRequested = true
-                activeCameraIds.forEach { openCamera(it) }
+        )
+        compositor = gl
+        gl.initialize { surfaces ->
+            if (gen != generation || !isAttached || compositor !== gl) {
+                if (compositor === gl) compositor = null
+                gl.release()
+                return@initialize
             }
+            if (!view.isAvailable && textureView === view && compositor === gl) {
+                // The preview surface went away between the calls that start initialization.
+                compositor = null
+                gl.release()
+                return@initialize
+            }
+            inputSurfaces.clear()
+            inputSurfaces.putAll(surfaces)
+            // A new compositor always starts on the main lens; adopt the selected rear lens.
+            gl.setActiveLens(lensCameraId)
+            openRequested = true
+            activeCameraIds.forEach { openCamera(it) }
         }
     }
 
@@ -248,9 +280,66 @@ class LensRecordingEngine(private val context: Context) {
         return true
     }
 
+    /** Returns to the rear lens even while idle; used when the UI camera state is stale. */
+    fun switchToRearLens(preferUltraWide: Boolean = rearLensId == CAMERA_ULTRA_WIDE_ID): Boolean {
+        if (!isFrontCamera && !cameraSwitchInProgress) return false
+        if (isRecording) {
+            switchToRearCamera()
+            return true
+        }
+        cameraSwitchInProgress = false
+        pendingCameraReadyId = null
+        val rearLens = if (preferUltraWide) CAMERA_ULTRA_WIDE_ID else CAMERA_MAIN_ID
+        rearLensId = rearLens
+        lensCameraId = rearLens
+        val view = textureView ?: return false
+        val activeProfile = profile ?: return false
+        release {
+            attachNow(
+                view,
+                rearLens,
+                codecMime,
+                audioEnabled,
+                activeProfile,
+                listener ?: return@release,
+                firstFrameCallback ?: return@release,
+            )
+        }
+        return true
+    }
+
+    /**
+     * Keeps the session alive with the rear main lens when the ultra-wide sensor fails, so the
+     * preview does not stay frozen on the last ultra-wide frame.
+     */
+    private fun fallbackToMainLens(gen: Int) {
+        if (gen != generation) return
+        closeSession(CAMERA_ULTRA_WIDE_ID)
+        releaseDevice(CAMERA_ULTRA_WIDE_ID)
+        activeCameraIds = if (isRecording) listOf(CAMERA_MAIN_ID) else listOf(CAMERA_MAIN_ID)
+        cameraSwitchInProgress = false
+        pendingCameraReadyId = null
+        notifyCameraSwitchStateChanged()
+    }
+
+    private fun activeStreamsReady(): Boolean =
+        activeCameraIds.all { cameras[it] != null && sessions[it] != null }
+
+    private fun startCameraSwitchWatchdog(gen: Int) {
+        mainHandler.postDelayed({
+            if (gen == generation && cameraSwitchInProgress) {
+                Log.w(tag, "camera switch timed out; restoring controls")
+                cameraSwitchInProgress = false
+                pendingCameraReadyId = null
+                notifyCameraSwitchStateChanged()
+            }
+        }, CAMERA_SWITCH_TIMEOUT_MS)
+    }
+
     private fun switchToFrontCamera() {
         val gen = generation
         cameraSwitchInProgress = true
+        startCameraSwitchWatchdog(gen)
         pendingCameraReadyId = null
         activeCameraIds = listOf(CAMERA_MAIN_ID, CAMERA_FRONT_ID)
         lensCameraId = CAMERA_FRONT_ID
@@ -266,7 +355,11 @@ class LensRecordingEngine(private val context: Context) {
                     notifyCameraSwitchStateChanged()
                     return@closeCamera
                 }
-                compositor?.switchTo(CAMERA_FRONT_ID, zoomRatio, waitForFrame = true) {
+                compositor?.switchTo(
+                    CAMERA_FRONT_ID,
+                    zoomRatio,
+                    waitForFrame = true,
+                ) {
                     if (gen == generation) {
                         cameraSwitchInProgress = false
                         notifyCameraSwitchStateChanged()
@@ -280,6 +373,7 @@ class LensRecordingEngine(private val context: Context) {
     private fun switchToRearCamera() {
         val gen = generation
         cameraSwitchInProgress = true
+        startCameraSwitchWatchdog(gen)
         activeCameraIds = rearCameraIds
         lensCameraId = CAMERA_MAIN_ID
         torchEnabled = false
@@ -293,6 +387,14 @@ class LensRecordingEngine(private val context: Context) {
                 return@switchTo
             }
             closeSession(CAMERA_FRONT_ID) {
+                if (gen != generation || !isRecording) {
+                    cameraSwitchInProgress = false
+                    notifyCameraSwitchStateChanged()
+                    return@closeSession
+                }
+                // Re-establish the rear main lens before releasing the front camera, so the
+                // ultra-wide sensor does not have to open while another device is closing.
+                createSession(CAMERA_MAIN_ID, gen)
                 closeCamera(CAMERA_FRONT_ID) {
                     if (gen != generation || !isRecording) {
                         cameraSwitchInProgress = false
@@ -312,16 +414,40 @@ class LensRecordingEngine(private val context: Context) {
         mainHandler.post { onCameraSwitchStateChanged?.invoke() }
     }
 
+    /**
+     * Unblocks the camera-switch UI. The GL transition callback is not guaranteed to run
+     * (for example when recording stops mid-switch), so every terminal path clears the state.
+     */
+    private fun resetCameraSwitchState() {
+        if (!cameraSwitchInProgress && pendingCameraReadyId == null) return
+        cameraSwitchInProgress = false
+        pendingCameraReadyId = null
+        Log.d(tag, "camera switch state reset")
+        notifyCameraSwitchStateChanged()
+    }
+
     /** Starts a crossfade/zoom blend in both the preview and the active video output. */
-    fun switchLens(cameraId: String) {
+    /**
+     * Switches the rear lens. Returns false when the target camera is not ready yet, so the UI
+     * does not show the new lens as active before the viewfinder actually changes.
+     */
+    fun switchLens(cameraId: String): Boolean {
         if (cameraId !in rearCameraIds || cameraSwitchInProgress ||
             cameraId == lensCameraId || !isAttached || cameras[cameraId] == null
-        ) return
+        ) return false
+        val previousLens = lensCameraId
         lensCameraId = cameraId
+        if (cameraId != CAMERA_FRONT_ID) rearLensId = cameraId
         torchEnabled = false
         focusPoint = null
-        compositor?.switchTo(cameraId, zoomRatio)
+        val gl = compositor
+        if (gl == null) {
+            lensCameraId = previousLens
+            return false
+        }
+        gl.switchTo(cameraId, zoomRatio)
         updateRepeatingRequests()
+        return true
     }
 
     fun setRecordingProfile(newProfile: RecordingProfile) {
@@ -332,11 +458,63 @@ class LensRecordingEngine(private val context: Context) {
         reconfigureAllSessions(gen, profileGen, newProfile)
     }
 
+    /**
+     * Continuous zoom across both rear sensors. Below 1x the ultra-wide camera provides the
+     * frame; at 1x and above the rear main camera does. Front-camera sessions keep 1x.
+     */
     fun setZoomRatio(value: Float) {
-        if (isUltraWide) return
-        zoomRatio = value.coerceIn(1f, maximumZoomRatio.coerceAtLeast(1f))
-        compositor?.setMainZoomRatio(zoomRatio)
-        updateRepeatingRequests(CAMERA_MAIN_ID)
+        if (isFrontCamera) return
+        val max = maximumZoomRatio.coerceAtLeast(1f)
+        val requested = value.coerceIn(MIN_ZOOM_RATIO, max)
+        val target = if (requested < 1f) CAMERA_ULTRA_WIDE_ID else CAMERA_MAIN_ID
+        val lensChanged = target != lensCameraId
+        val previousLens = lensCameraId
+        if (lensChanged) lensCameraId = target
+        if (lensChanged && cameras[target] == null) {
+            // The lens is not streaming yet, so the viewfinder cannot switch to it.
+            lensCameraId = previousLens
+            return
+        }
+        zoomRatio = requested
+        rearLensId = target
+        compositor?.setZoomRatio(zoomRatio)
+        if (lensChanged) {
+            compositor?.switchTo(target, zoomRatio)
+            notifyCameraSwitchStateChanged()
+        }
+        updateRepeatingRequests()
+    }
+
+    /** Widest ultra-wide zoom, i.e. the native ultra-wide sensor frame. */
+    fun zoomToWidest() {
+        animateZoomTo(MIN_ZOOM_RATIO)
+    }
+
+    /** Animated zoom, so pinch and slider changes read as a continuous zoom. */
+    fun animateZoomTo(value: Float) {
+        if (isFrontCamera) return
+        val max = maximumZoomRatio.coerceAtLeast(1f)
+        zoomTarget = value.coerceIn(MIN_ZOOM_RATIO, max)
+        if (zoomAnimating) return
+        zoomAnimating = true
+        mainHandler.post(zoomAnimator)
+    }
+
+    private fun stepZoomAnimation(): Boolean {
+        if (!zoomAnimating) return false
+        val max = maximumZoomRatio.coerceAtLeast(1f)
+        val target = zoomTarget.coerceIn(MIN_ZOOM_RATIO, max)
+        val remaining = target - zoomRatio
+        if (abs(remaining) <= ZOOM_STEP_EPSILON) {
+            setZoomRatio(target)
+            zoomAnimating = false
+            return false
+        }
+        // Exponential approach: fast at first, settling smoothly on the target.
+        val step = remaining * ZOOM_STEP_FACTOR
+        val next = (zoomRatio + step).coerceIn(MIN_ZOOM_RATIO, max)
+        setZoomRatio(if (remaining > 0f) next.coerceAtMost(target) else next.coerceAtLeast(target))
+        return true
     }
 
     fun setExposureCompensationIndex(value: Int) {
@@ -374,8 +552,13 @@ class LensRecordingEngine(private val context: Context) {
     }
 
     fun startRecording(recordingProfile: RecordingProfile) {
-        if (recording || activeCameraIds.any { cameras[it] == null || sessions[it] == null }) {
-            if (!recording) listener?.onError("both rear camera streams are not ready")
+        if (recording || !activeStreamsReady()) {
+            if (!recording) {
+                listener?.onError(
+                    if (cameraSwitchInProgress) "camera switch is still in progress"
+                    else "camera streams are not ready",
+                )
+            }
             return
         }
         profile = recordingProfile
@@ -450,6 +633,12 @@ class LensRecordingEngine(private val context: Context) {
     fun stopRecording() {
         if (!recording) return
         recordingPending = false
+        if (recordingPaused) {
+            // Some recorder implementations fail to finalize while paused.
+            runCatching { recorder?.resume() }
+            recordingPaused = false
+            pausedAtMs = 0L
+        }
         compositor?.detachEncoderSurface { finishRecorder(notify = true) }
             ?: finishRecorder(notify = true)
     }
@@ -465,6 +654,7 @@ class LensRecordingEngine(private val context: Context) {
             true
         } catch (t: Throwable) {
             Log.w(tag, "recorder pause failed", t)
+            listener?.onError("recorder pause failed: ${t.message}")
             false
         }
     }
@@ -619,6 +809,9 @@ class LensRecordingEngine(private val context: Context) {
         generation++
         closing = true
         openRequested = false
+        zoomAnimating = false
+        mainHandler.removeCallbacks(zoomAnimator)
+        resetCameraSwitchState()
         pendingCloseCallback = onClosed
         mainHandler.removeCallbacks(ticker)
         if (photoCaptureInProgress) {
@@ -640,12 +833,18 @@ class LensRecordingEngine(private val context: Context) {
         if (oldCompositor == null) inputSurfaces.clear()
         textureView?.surfaceTextureListener = null
         textureView = null
-        cameras.values.toList().forEach { runCatching { it.close() } }
+        cameras.keys.toList().forEach { releaseDevice(it) }
         maybeCompleteRelease()
     }
 
     private fun openCamera(id: String, retry: Int = 0) {
         if (!openRequested || !isAttached || id !in activeCameraIds || id in cameras || id in openingIds) return
+        // The HAL here refuses to open the ultra-wide sensor while another camera device is
+        // still closing, which shows up as ERROR_CAMERA_DEVICE and freezes the preview.
+        if (closingCameraIds.any { it != id }) {
+            if (id !in pendingOpenIds) pendingOpenIds.add(id)
+            return
+        }
         val gen = generation
         openingIds.add(id)
         var retryAfterClose = false
@@ -668,25 +867,61 @@ class LensRecordingEngine(private val context: Context) {
                 }
 
                 override fun onError(device: CameraDevice, error: Int) {
-                    retryAfterClose = error == CameraDevice.StateCallback.ERROR_CAMERA_IN_USE ||
-                            error == CameraDevice.StateCallback.ERROR_CAMERA_DEVICE
-                    if (!retryAfterClose) listener?.onError("camera $id error=$error")
-                    device.close()
+                    // Treat the documented recoverable camera errors as retryable. The device
+                    // error here is usually raised while another camera device is still closing.
+                    val canRetry = error in RECOVERABLE_CAMERA_ERRORS
+                    Log.w(tag, "camera $id error=$error retry=$retry")
+                    // Camera2 already closed the device after onError.
+                    if (cameras[id] === device) cameras.remove(id)
+                    openingIds.remove(id)
+                    if (gen != generation || !openRequested) return
+
+                    if (canRetry && closingCameraIds.any { it != id }) {
+                        // Another device is still closing; wait for it instead of spending a
+                        // retry attempt, otherwise every retry hits the same HAL conflict.
+                        if (id !in pendingOpenIds) pendingOpenIds.add(id)
+                        return
+                    }
+
+                    if (canRetry && retry < MAX_OPEN_RETRIES) {
+                        // Give cameraserver and the HAL time to release the previous device;
+                        // a fixed short delay keeps failing with ERROR_CAMERA_DEVICE here.
+                        val delay = OPEN_RETRY_DELAY_MS * (retry + 1)
+                        mainHandler.postDelayed({
+                            if (gen == generation && openRequested && id in activeCameraIds) {
+                                openCamera(id, retry + 1)
+                            }
+                        }, delay)
+                        return
+                    }
+
+                    if (id == CAMERA_ULTRA_WIDE_ID) {
+                        // Keep the session usable with the rear main lens instead of leaving
+                        // the preview frozen on the last frame.
+                        listener?.onError("ultra-wide camera unavailable (error=$error)")
+                        fallbackToMainLens(gen)
+                        return
+                    }
+
+                    listener?.onError("camera $id error=$error")
                 }
 
                 override fun onClosed(device: CameraDevice) {
                     if (cameras[id] === device) cameras.remove(id)
                     openingIds.remove(id)
+                    closingCameraIds.remove(id)
                     cameraCloseCallbacks.remove(device)?.let { callback ->
                         callback()
                         maybeCompleteRelease()
                         return
                     }
                     if (closing) maybeCompleteRelease()
-                    else if (openRequested && gen != generation) openCamera(id)
+                    else if (!openRequested) Unit // Released deliberately; do not reconnect.
+                    else if (gen != generation) openCamera(id)
                     else if (retryAfterClose && retry < MAX_OPEN_RETRIES) {
                         mainHandler.postDelayed({ if (gen == generation) openCamera(id, retry + 1) }, OPEN_RETRY_DELAY_MS)
                     } else if (retryAfterClose) listener?.onError("camera $id unavailable")
+                    runPendingOpens()
                 }
             }, mainHandler)
         } catch (t: Throwable) {
@@ -706,8 +941,11 @@ class LensRecordingEngine(private val context: Context) {
         profileGen: Int = profileChangeGeneration,
     ) {
         if (id !in activeCameraIds) return
-        val device = cameras[id] ?: return
-        if (!configuringSessionIds.add(id)) return
+        val device = cameras[id]
+        if (device == null || !configuringSessionIds.add(id)) {
+            drainSessionCallbacks()
+            return
+        }
         val input = inputSurfaces[id] ?: run {
             configuringSessionIds.remove(id)
             drainSessionCallbacks()
@@ -737,8 +975,9 @@ class LensRecordingEngine(private val context: Context) {
                     if (id == pendingCameraReadyId) {
                         pendingCameraReadyId = null
                         cameraSwitchInProgress = false
-                        notifyCameraSwitchStateChanged()
                     }
+                    // A lens that finished opening can now be selected in the UI.
+                    notifyCameraSwitchStateChanged()
                     drainSessionCallbacks()
                 }
 
@@ -947,15 +1186,30 @@ class LensRecordingEngine(private val context: Context) {
     }
 
     private fun closeCamera(id: String, afterClosed: () -> Unit) {
-        val device = cameras[id] ?: run {
+        val device = cameras.remove(id) ?: run {
             afterClosed()
             return
         }
+        closingCameraIds.add(id)
         cameraCloseCallbacks[device] = afterClosed
         runCatching { device.close() }.onFailure {
             cameraCloseCallbacks.remove(device)
+            closingCameraIds.remove(id)
             afterClosed()
         }
+    }
+
+    private fun releaseDevice(id: String) {
+        val device = cameras.remove(id) ?: return
+        closingCameraIds.add(id)
+        runCatching { device.close() }.onFailure { closingCameraIds.remove(id) }
+    }
+
+    private fun runPendingOpens() {
+        if (closingCameraIds.isNotEmpty() || pendingOpenIds.isEmpty()) return
+        val ids = pendingOpenIds.toList()
+        pendingOpenIds.clear()
+        ids.forEach { id -> openCamera(id) }
     }
 
     private fun closeSessionObject(session: CameraCaptureSession) {
@@ -1024,6 +1278,7 @@ class LensRecordingEngine(private val context: Context) {
         recordingPaused = false
         pausedAtMs = 0L
         recording = false
+        resetCameraSwitchState()
         recordingPending = false
         recorderStarted = false
         mainHandler.removeCallbacks(ticker)
@@ -1051,7 +1306,8 @@ class LensRecordingEngine(private val context: Context) {
 
     private fun maybeCompleteRelease() {
         if (!closing || cameras.isNotEmpty() || openingIds.isNotEmpty() ||
-            closingSessions.isNotEmpty() || configuringSessionIds.isNotEmpty() || compositor != null
+            closingCameraIds.isNotEmpty() || closingSessions.isNotEmpty() ||
+            configuringSessionIds.isNotEmpty() || compositor != null
         ) return
         closing = false
         val callback = pendingCloseCallback
@@ -1122,6 +1378,22 @@ class LensRecordingEngine(private val context: Context) {
         private const val PHOTO_CAPTURE_SETTLE_MS = 100L
         private const val PHOTO_CAPTURE_TIMEOUT_MS = 5000L
         private const val MAX_FRONT_CAMERA_FPS = 30
+        private const val CAMERA_SWITCH_TIMEOUT_MS = 5000L
+        /**
+         * Widest rear coverage, derived from the sensor focal lengths on this device:
+         * ultra-wide 1.64mm / rear main 4.81mm ~= 0.34 (advertised as 0.3x).
+         */
+        private const val MIN_ZOOM_RATIO = 0.3f
+        private const val ZOOM_STEP_FACTOR = 0.28f
+        private const val ZOOM_STEP_EPSILON = 0.004f
+        private const val ZOOM_STEP_INTERVAL_MS = 16L
+        private val RECOVERABLE_CAMERA_ERRORS = setOf(
+            CameraDevice.StateCallback.ERROR_CAMERA_IN_USE,
+            CameraDevice.StateCallback.ERROR_MAX_CAMERAS_IN_USE,
+            CameraDevice.StateCallback.ERROR_CAMERA_DISABLED,
+            CameraDevice.StateCallback.ERROR_CAMERA_DEVICE,
+            CameraDevice.StateCallback.ERROR_CAMERA_SERVICE,
+        )
         private const val ASPECT_RATIO_TOLERANCE = 0.04f
         private const val STANDARD_PHOTO_PIXEL_LIMIT = 2_073_600L
 

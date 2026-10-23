@@ -190,18 +190,23 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
             }
             onCameraSwitchStateChanged = {
                 runOnUiThread {
-                    isUltraWideMode = lensRecordingEngine.isUltraWide
+                    val rearUltraWideAvailable = lensRecordingEngine.isRearUltraWideReady
+                    if (lastRearLensWasUltraWide && rearUltraWideAvailable && !isUltraWideMode) {
+                        setUltraWideMode(true)
+                    } else {
+                        isUltraWideMode = lensRecordingEngine.isUltraWide
+                    }
                     updateLensSelector()
                     applyLensRecordingControls()
-                    flipCameraButton.isEnabled = canSwitchLensDuringRecording()
-                    flipCameraButton.isInvisible = !viewModel.canFlipCamera.value &&
-                            !canSwitchLensDuringRecording()
+                    applyFlipCameraButtonState()
                 }
             }
         }
     }
     private var isLensRecordingMode = false
     private var isUltraWideMode = false
+    /** Last rear lens the user picked, kept while the front/selfie camera is selected. */
+    private var lastRearLensWasUltraWide = false
     private var lensZoomGestureConsumed = false
     private var blurFromUltraWide = false
     private val isUltraWideAvailable by lazy { LensRecordingEngine.isUltraWideAvailable(this) }
@@ -226,9 +231,9 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
     private val viewFinderFocus by lazy { findViewById<ImageView>(R.id.viewFinderFocus) }
     private val zoomLevel by lazy { findViewById<HorizontalSlider>(R.id.zoomLevel) }
 
-    private val mumbaHighSpeedListener = object : MumbaHighSpeedEngine.Listener {
+    private val mumbaLensListener = object : MumbaHighSpeedEngine.Listener {
         override fun onRecordingStarted(uri: Uri?) = runOnUiThread {
-            startVideoRecordingStateAnimation(VideoRecordingStateAnimation.Init)
+            updateVideoRecordingStateIcon(isPaused = false)
             viewModel.cameraState.value = CameraState.RECORDING_VIDEO
         }
 
@@ -306,8 +311,10 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
 
                 is ZoomGestureDetector.ZoomEvent.Move -> {
                     if (isLensRecordingMode) {
-                        lensRecordingEngine.setZoomRatio(
-                            lensRecordingEngine.currentZoomRatio * it.incrementalScaleFactor,
+                        // The raw pinch factor is too slow, so amplify it.
+                        val amplified = 1f + (it.incrementalScaleFactor - 1f) * PINCH_ZOOM_GAIN
+                        lensRecordingEngine.animateZoomTo(
+                            lensRecordingEngine.currentZoomRatio * amplified,
                         )
                         updateLensZoomControls(show = true)
                     } else {
@@ -578,8 +585,9 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
 
         zoomLevel.onProgressChangedByUser = {
             if (isLensRecordingMode) {
+                val minZoom = lensRecordingEngine.minimumZoomRatio
                 val maxZoom = lensRecordingEngine.maximumZoomRatio.coerceAtLeast(1f)
-                lensRecordingEngine.setZoomRatio(1f + it * (maxZoom - 1f))
+                lensRecordingEngine.animateZoomTo(minZoom + it * (maxZoom - minZoom))
                 updateLensZoomControls(show = true)
             } else {
                 viewModel.cameraController.setLinearZoom(it)
@@ -600,7 +608,11 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
 
         // Set primary bar button callbacks
         flipCameraButton.setOnClickListener {
-            if (isLensRecordingMode && viewModel.cameraState.value.isRecordingVideo) {
+        if (isLensRecordingMode) {
+            val recordingState = viewModel.cameraState.value
+            if (recordingState == CameraState.RECORDING_VIDEO ||
+                recordingState == CameraState.RECORDING_VIDEO_PAUSED
+            ) {
                 if (lensRecordingEngine.switchCameraDuringRecording()) {
                     isUltraWideMode = false
                     updateLensSelector()
@@ -608,9 +620,16 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                 }
                 return@setOnClickListener
             }
+        }
             if (isUltraWideMode) {
                 isUltraWideMode = false
                 updateLensSelector()
+            }
+            if (isLensRecordingMode && lensRecordingEngine.switchToRearLens(lastRearLensWasUltraWide)) {
+                isUltraWideMode = lastRearLensWasUltraWide
+                updateLensSelector()
+                updateLensZoomControls()
+                return@setOnClickListener
             }
             viewModel.flipCamera()
         }
@@ -621,10 +640,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                 val changed = if (resume) lensRecordingEngine.resumeRecording()
                 else lensRecordingEngine.pauseRecording()
                 if (changed) {
-                    startVideoRecordingStateAnimation(
-                        if (resume) VideoRecordingStateAnimation.PauseToResume
-                        else VideoRecordingStateAnimation.ResumeToPause,
-                    )
+                    updateVideoRecordingStateIcon(isPaused = !resume)
                     viewModel.cameraState.value = if (resume) CameraState.RECORDING_VIDEO
                     else CameraState.RECORDING_VIDEO_PAUSED
                 }
@@ -701,7 +717,9 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         // Set lens switching callback
         lensSelectorLayout.onCameraChangeCallback = { camera ->
             if (isLensRecordingMode && camera.cameraId == LensRecordingEngine.CAMERA_MAIN_ID) {
-                setUltraWideMode(false)
+                if (!lensRecordingEngine.switchToRearLens(lastRearLensWasUltraWide)) {
+                    setUltraWideMode(false)
+                }
             } else {
                 viewModel.selectCamera(camera)
             }
@@ -711,7 +729,13 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         }
         lensSelectorLayout.onZoomRatioChangeCallback = {
             if (isLensRecordingMode) {
-                lensRecordingEngine.setZoomRatio(it)
+                if (it <= lensRecordingEngine.minimumZoomRatio + 0.001f) {
+                    // The 0.3x button must select the native ultra-wide frame, not just swap the
+                    // lens while the zoom ratio stays at 1x.
+                    setUltraWideMode(true)
+                } else {
+                    lensRecordingEngine.animateZoomTo(it)
+                }
                 updateLensZoomControls(show = true)
             } else {
                 viewModel.smoothZoom(it)
@@ -719,7 +743,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         }
         lensSelectorLayout.onResetZoomRatioCallback = {
             if (isLensRecordingMode) {
-                lensRecordingEngine.setZoomRatio(1f)
+                lensRecordingEngine.animateZoomTo(1f)
                 updateLensZoomControls(show = true)
             } else {
                 viewModel.resetZoom()
@@ -1075,10 +1099,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                 // Update primary bar buttons
                 galleryButtonCardView.isEnabled = cameraState == CameraState.IDLE
                 // Shutter button must stay enabled
-                flipCameraButton.isEnabled = cameraState == CameraState.IDLE ||
-                        (isLensRecordingMode && cameraState.isRecordingVideo && canSwitchLensDuringRecording())
-                flipCameraButton.isInvisible = !viewModel.canFlipCamera.value &&
-                        !canSwitchLensDuringRecording()
+                applyFlipCameraButtonState()
                 videoRecordingStateButton.isVisible =
                     cameraState.isRecordingVideo && (!isEngineVideoMode || isLensRecordingMode)
 
@@ -1534,21 +1555,15 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
             viewModel.videoRecordEvent.collect { videoRecordEvent ->
                 when (videoRecordEvent) {
                     is VideoRecordEvent.Start -> runOnUiThread {
-                        startVideoRecordingStateAnimation(
-                            VideoRecordingStateAnimation.Init
-                        )
+                        updateVideoRecordingStateIcon(isPaused = false)
                     }
 
                     is VideoRecordEvent.Pause -> runOnUiThread {
-                        startVideoRecordingStateAnimation(
-                            VideoRecordingStateAnimation.ResumeToPause
-                        )
+                        updateVideoRecordingStateIcon(isPaused = true)
                     }
 
                     is VideoRecordEvent.Resume -> runOnUiThread {
-                        startVideoRecordingStateAnimation(
-                            VideoRecordingStateAnimation.PauseToResume
-                        )
+                        updateVideoRecordingStateIcon(isPaused = false)
                     }
 
                     is VideoRecordEvent.Status -> {
@@ -1648,19 +1663,16 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         }
     }
 
-    private fun startVideoRecordingStateAnimation(animation: VideoRecordingStateAnimation) {
-        // Get appropriate drawable
-        val drawable = ContextCompat.getDrawable(
-            this, animation.resourceId
-        ) as AnimatedVectorDrawable
-
-        // Update current drawable
-        videoRecordingStateButton.setImageDrawable(drawable)
-
-        // Start or reset animation
-        when (animation) {
-            VideoRecordingStateAnimation.Init -> drawable.reset()
-            else -> drawable.start()
+    private fun updateVideoRecordingStateIcon(isPaused: Boolean) {
+        try {
+            val drawable = ContextCompat.getDrawable(
+                this, if (isPaused) VideoRecordingStateAnimation.PauseToResume.resourceId
+                else VideoRecordingStateAnimation.Init.resourceId,
+            ) as AnimatedVectorDrawable
+            videoRecordingStateButton.setImageDrawable(drawable)
+            drawable.reset()
+        } catch (t: Throwable) {
+            Log.w(LOG_TAG, "Could not update recording state icon", t)
         }
     }
 
@@ -1791,14 +1803,23 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
     private fun updateLensSelector() {
         val canShowUltraWide = !isLensRecordingMode ||
                 (!lensRecordingEngine.isFrontCamera && !lensRecordingEngine.isCameraSwitching)
+
         lensSelectorLayout.setAuxLens(
             enabled = isLensModeConfiguration(currentCameraConfiguration) && canShowUltraWide,
             active = isUltraWideMode,
         )
     }
 
+    private fun applyFlipCameraButtonState() {
+        val cameraState = viewModel.cameraState.value
+        val canSwitch = canSwitchLensDuringRecording()
+        flipCameraButton.isEnabled = cameraState == CameraState.IDLE || canSwitch
+        flipCameraButton.isInvisible = !viewModel.canFlipCamera.value && !canSwitch
+    }
+
     private fun canSwitchLensDuringRecording(): Boolean =
-        isLensRecordingMode && lensRecordingEngine.canSwitchCameraDuringRecording
+        isLensRecordingMode && viewModel.cameraState.value != CameraState.RECORDING_VIDEO_PAUSED &&
+                lensRecordingEngine.canSwitchCameraDuringRecording
 
     private fun setUltraWideMode(enabled: Boolean) {
         val configuration = currentCameraConfiguration ?: return
@@ -1807,12 +1828,15 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         ) return
         if (enabled == isUltraWideMode) return
         isUltraWideMode = enabled
+        lastRearLensWasUltraWide = enabled
         updateLensSelector()
         if (lensRecordingEngine.isAttached) {
-            lensRecordingEngine.switchLens(
-                if (enabled) LensRecordingEngine.CAMERA_ULTRA_WIDE_ID
-                else LensRecordingEngine.CAMERA_MAIN_ID,
-            )
+            if (enabled) {
+                // Select the widest zoom so the ultra-wide frame is the native sensor frame.
+                lensRecordingEngine.zoomToWidest()
+            } else {
+                lensRecordingEngine.animateZoomTo(1f)
+            }
             applyLensRecordingControls()
         } else {
             bindCameraUseCases(configuration)
@@ -1861,14 +1885,15 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         }
         lensRecordingEngine.attach(
             mumbaHighSpeedPreview,
-            if (isUltraWideMode) LensRecordingEngine.CAMERA_ULTRA_WIDE_ID
+            if (isUltraWideMode || lastRearLensWasUltraWide) LensRecordingEngine.CAMERA_ULTRA_WIDE_ID
             else LensRecordingEngine.CAMERA_MAIN_ID,
             viewModel.videoCodecMime,
             viewModel.videoMicMode.value,
             profile,
-            mumbaHighSpeedListener,
+            mumbaLensListener,
             onFirstFrame = { previewBlurView.isVisible = false },
         )
+        isUltraWideMode = isUltraWideMode || lastRearLensWasUltraWide
         applyLensRecordingControls()
         updateLensSelector()
     }
@@ -1896,17 +1921,17 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
     }
 
     private fun updateLensZoomControls(show: Boolean = false) {
-        if (!isLensRecordingMode || lensRecordingEngine.isUltraWide) {
+        if (!isLensRecordingMode || lensRecordingEngine.isFrontCamera) {
             zoomLevel.isVisible = false
             return
         }
+        val minZoom = lensRecordingEngine.minimumZoomRatio
         val maxZoom = lensRecordingEngine.maximumZoomRatio.coerceAtLeast(1f)
-        zoomLevel.progress = if (maxZoom <= 1f) 0f else {
-            ((lensRecordingEngine.currentZoomRatio - 1f) / (maxZoom - 1f)).coerceIn(0f, 1f)
-        }
+        val span = (maxZoom - minZoom).coerceAtLeast(0.01f)
+        zoomLevel.progress = ((lensRecordingEngine.currentZoomRatio - minZoom) / span).coerceIn(0f, 1f)
         lensSelectorLayout.onZoomRatioChanged(lensRecordingEngine.currentZoomRatio)
         if (show) {
-            zoomLevel.isVisible = maxZoom > 1f
+            zoomLevel.isVisible = true
             handler.removeMessages(MSG_HIDE_ZOOM_SLIDER)
             handler.sendMessageDelayed(handler.obtainMessage(MSG_HIDE_ZOOM_SLIDER), 2000)
         }
@@ -1988,7 +2013,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                 cameraConfiguration.camera.cameraId,
                 viewModel.videoCodecMime,
                 viewModel.videoMicMode.value,
-                mumbaHighSpeedListener,
+            mumbaLensListener,
             )
             return
         }
@@ -2627,6 +2652,9 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         private const val MSG_HIDE_FOCUS_RING = 1
         private const val MSG_HIDE_EXPOSURE_SLIDER = 2
         private const val MSG_ON_PINCH_TO_ZOOM = 3
+
+        /** Raw pinch deltas are too slow for the wide 0.3x-8x range. */
+        private const val PINCH_ZOOM_GAIN = 9f
 
         // We need to return something small enough so as not to overwhelm Binder. 1MB is the
         // per-process limit across all transactions. Camera2 sets a max pixel count of 51200.

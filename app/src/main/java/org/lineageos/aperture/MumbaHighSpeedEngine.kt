@@ -337,6 +337,11 @@ class MumbaHighSpeedEngine(private val context: Context) {
     fun startRecording() {
         val device = camera ?: return
         if (recording || warmingUp) return
+        val view = textureView
+        if (view == null || (!view.isAvailable && view.surfaceTexture == null)) {
+            listener?.onError("preview surface is not ready")
+            return
+        }
         val output = createOutput() ?: run {
             listener?.onError("cannot create output")
             return
@@ -377,7 +382,16 @@ class MumbaHighSpeedEngine(private val context: Context) {
         try { session?.stopRepeating() } catch (_: Throwable) {}
         try { session?.close() } catch (_: Throwable) {}
         session = null
-        ensurePreviewSurface()
+        val previewTarget = ensurePreviewSurface() ?: run {
+            releaseRecorder()
+            discardOutput(output)
+            listener?.onError("preview surface is not ready")
+            startPreview()
+            return
+        }
+        // A constrained high-speed session can record without a preview target,
+        // but the preview is required to keep the viewfinder live.
+        val surfaces = listOfNotNull(previewTarget, rec.surface)
 
         val callback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(s: CameraCaptureSession) {
@@ -385,7 +399,7 @@ class MumbaHighSpeedEngine(private val context: Context) {
                     val hs = s as android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
                     val request = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                         addTarget(rec.surface)
-                        previewSurface?.let { addTarget(it) }
+                        addTarget(previewTarget)
                         applyCommonOptions(this)
                         setFpsRange(device, this)
                     }
@@ -413,7 +427,6 @@ class MumbaHighSpeedEngine(private val context: Context) {
         }
 
         try {
-            val surfaces = listOfNotNull(previewSurface, rec.surface)
             device.createConstrainedHighSpeedCaptureSession(surfaces, callback, handler)
         } catch (t: Throwable) {
             releaseRecorder()

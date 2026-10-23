@@ -51,6 +51,7 @@ internal class LensVideoCompositor(
         val cameraId: String,
         val mainZoom: Float,
         val onComplete: (() -> Unit)?,
+        val deadlineNs: Long,
     )
 
     private val tag = "LensCompositor"
@@ -92,6 +93,7 @@ internal class LensVideoCompositor(
     private var transitionFrom: String? = null
     private var transitionTo: String? = null
     private var transitionStartNs = 0L
+    private var transitionRunning = false
     private var pendingSwitch: PendingSwitch? = null
     private var transitionCompleteCallback: (() -> Unit)? = null
     private var mainZoomRatio = 1f
@@ -165,10 +167,11 @@ internal class LensVideoCompositor(
         }
     }
 
-    fun updatePreviewTransform() {
-        glHandler.post {
-            try {
-                val texture = textureView.surfaceTexture ?: return@post
+     fun updatePreviewTransform() {
+         glHandler.post {
+             if (released.get()) return@post
+             try {
+                 val texture = textureView.surfaceTexture ?: return@post
                 texture.setDefaultBufferSize(
                     textureView.width.coerceAtLeast(1),
                     textureView.height.coerceAtLeast(1),
@@ -233,10 +236,26 @@ internal class LensVideoCompositor(
             }
             val target = inputs[cameraId]
             if (waitForFrame && target?.hasFrame != true) {
-                pendingSwitch = PendingSwitch(cameraId, mainZoom, onComplete)
+                pendingSwitch = PendingSwitch(
+                    cameraId,
+                    mainZoom,
+                    onComplete,
+                    System.nanoTime() + PENDING_SWITCH_TIMEOUT_NS,
+                )
             } else {
                 beginTransition(cameraId, mainZoom, onComplete)
             }
+        }
+    }
+
+    /** Selects the lens shown by a freshly initialized compositor, without animating. */
+    fun setActiveLens(cameraId: String) {
+        glHandler.post {
+            pendingSwitch = null
+            transitionFrom = null
+            transitionTo = null
+            transitionRunning = false
+            activeLensId = cameraId
         }
     }
 
@@ -249,8 +268,15 @@ internal class LensVideoCompositor(
         }
     }
 
-    fun setMainZoomRatio(zoom: Float) {
-        glHandler.post { mainZoomRatio = zoom.coerceAtLeast(1f) }
+    /** Applies a continuous zoom ratio that spans the ultra-wide and rear main sensors. */
+    fun setZoomRatio(zoom: Float) {
+        glHandler.post {
+            mainZoomRatio = zoom.coerceAtLeast(MIN_ZOOM_RATIO)
+        }
+    }
+
+    fun resetZoomRatio() {
+        glHandler.post { mainZoomRatio = 1f }
     }
 
     fun release(onReleased: (() -> Unit)? = null) {
@@ -409,9 +435,24 @@ internal class LensVideoCompositor(
         }
 
         pendingSwitch?.let { request ->
-            if (inputs[request.cameraId]?.hasFrame == true) {
+            val targetReady = inputs[request.cameraId]?.hasFrame == true
+            if (targetReady || System.nanoTime() >= request.deadlineNs) {
                 pendingSwitch = null
-                beginTransition(request.cameraId, request.mainZoom, request.onComplete)
+                if (targetReady) {
+                    beginTransition(
+                        request.cameraId,
+                        request.mainZoom,
+                        request.onComplete,
+                    )
+                } else {
+                    // The target source never produced a frame; unblock the caller instead of
+                    // leaving the switch pending forever.
+                    Log.w(
+                        tag,
+                        "pending switch to ${request.cameraId} timed out; keeping $activeLensId",
+                    )
+                    request.onComplete?.let { mainHandler.post(it) }
+                }
             }
         }
 
@@ -432,26 +473,23 @@ internal class LensVideoCompositor(
             if (fromInput?.hasFrame == true && toInput?.hasFrame == true) {
                 val t = ((now - transitionStartNs).toFloat() / TRANSITION_NS).coerceIn(0f, 1f)
                 val eased = t * t * (3f - 2f * t)
+                if (!transitionRunning) {
+                    transitionRunning = true
+                    transitionStartNs = now
+                }
                 first = fromInput
                 second = toInput
                 blend = eased
+                // Both sources use the crop for the current zoom, so the first frame after a lens
+                // change already matches the viewfinder framing; the zoom animation then keeps
+                // moving that crop instead of snapping back on the next frame.
                 firstZoom = zoomFor(from)
                 secondZoom = zoomFor(to)
-                if (from == LensRecordingEngine.CAMERA_MAIN_ID &&
-                    to == LensRecordingEngine.CAMERA_ULTRA_WIDE_ID
-                ) {
-                    secondZoom = (mainZoomRatio / ULTRA_WIDE_RELATIVE_ZOOM).coerceAtLeast(1f) *
-                            (1f - eased) + eased
-                } else if (from == LensRecordingEngine.CAMERA_ULTRA_WIDE_ID &&
-                    to == LensRecordingEngine.CAMERA_MAIN_ID
-                ) {
-                    firstZoom = 1f + ((mainZoomRatio / ULTRA_WIDE_RELATIVE_ZOOM).coerceAtLeast(1f) - 1f) *
-                            eased
-                }
                 if (t >= 1f) {
                     activeLensId = to
                     transitionFrom = null
                     transitionTo = null
+                    transitionRunning = false
                     val onComplete = transitionCompleteCallback
                     transitionCompleteCallback = null
                     mainHandler.post {
@@ -492,13 +530,18 @@ internal class LensVideoCompositor(
         }
     }
 
-    private fun beginTransition(cameraId: String, mainZoom: Float, onComplete: (() -> Unit)?) {
+    private fun beginTransition(
+        cameraId: String,
+        mainZoom: Float,
+        onComplete: (() -> Unit)?,
+    ) {
         if (cameraId == activeLensId && transitionTo == null) {
             mainHandler.post { onComplete?.invoke() }
             return
         }
         transitionFrom = transitionTo ?: activeLensId
         transitionTo = cameraId
+        transitionRunning = false
         transitionStartNs = System.nanoTime()
         mainZoomRatio = mainZoom.coerceAtLeast(1f)
         transitionCompleteCallback = onComplete
@@ -506,7 +549,15 @@ internal class LensVideoCompositor(
     }
 
     private fun zoomFor(cameraId: String): Float = when (cameraId) {
-        LensRecordingEngine.CAMERA_MAIN_ID -> mainZoomRatio
+        LensRecordingEngine.CAMERA_MAIN_ID -> mainZoomRatio.coerceAtLeast(1f)
+        LensRecordingEngine.CAMERA_ULTRA_WIDE_ID -> {
+            // Zoom 0.3x is the native ultra-wide frame (crop 1.0). Zooming towards 1x crops in,
+            // but with a gentle slope so 0.9x stays near the rear main 1x framing. The crop never
+            // drops below 1.0, otherwise the shader would sample outside the texture and produce
+            // coloured edge artifacts.
+            (1f + (mainZoomRatio / ULTRA_WIDE_RELATIVE_ZOOM - 1f) * ULTRA_WIDE_CROP_SLOPE)
+                .coerceIn(MIN_CROP, MAX_CROP)
+        }
         else -> 1f
     }
 
@@ -530,7 +581,9 @@ internal class LensVideoCompositor(
         GLES20.glViewport(0, 0, w[0], h[0])
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-        val sourceAspect = if (applySurfaceTransform && swapsAxes(main.transform)) {
+        val appliedMainMatrix = if (applySurfaceTransform) main.transform else RAW_TEXTURE_MATRIX
+        val appliedUltraMatrix = if (applySurfaceTransform) ultra.transform else RAW_TEXTURE_MATRIX
+        val sourceAspect = if (swapsAxes(appliedMainMatrix) || swapsAxes(appliedUltraMatrix)) {
             1f / targetAspectRatio
         } else {
             targetAspectRatio
@@ -554,12 +607,10 @@ internal class LensVideoCompositor(
         vertices.position(2)
         GLES20.glEnableVertexAttribArray(texCoordLocation)
         GLES20.glVertexAttribPointer(texCoordLocation, 2, GLES20.GL_FLOAT, false, 16, vertices)
-        val mainMatrix = if (applySurfaceTransform) main.transform else RAW_TEXTURE_MATRIX
-        val ultraMatrix = if (applySurfaceTransform) ultra.transform else RAW_TEXTURE_MATRIX
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, main.textureId)
         GLES20.glUniform1i(mainSamplerLocation, 0)
-        GLES20.glUniformMatrix4fv(mainMatrixLocation, 1, false, mainMatrix, 0)
+        GLES20.glUniformMatrix4fv(mainMatrixLocation, 1, false, appliedMainMatrix, 0)
         GLES20.glUniform1f(mainZoomLocation, mainZoom)
         GLES20.glUniform1i(
             mainPixelRotationLocation,
@@ -572,7 +623,7 @@ internal class LensVideoCompositor(
         GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, ultra.textureId)
         GLES20.glUniform1i(ultraSamplerLocation, 1)
-        GLES20.glUniformMatrix4fv(ultraMatrixLocation, 1, false, ultraMatrix, 0)
+        GLES20.glUniformMatrix4fv(ultraMatrixLocation, 1, false, appliedUltraMatrix, 0)
         GLES20.glUniform1f(ultraZoomLocation, ultraZoom)
         GLES20.glUniform1i(
             ultraPixelRotationLocation,
@@ -604,8 +655,38 @@ internal class LensVideoCompositor(
 
     companion object {
         private const val EGL_RECORDABLE_ANDROID = 0x3142
-        private const val TRANSITION_NS = 520_000_000L
-        private const val ULTRA_WIDE_RELATIVE_ZOOM = 0.6f
+        private const val TRANSITION_NS = 0L
+        private const val PENDING_SWITCH_TIMEOUT_NS = 3_000_000_000L
+        /**
+         * Ultra-wide crop intensity, deliberately gentler than the physical focal-length ratio
+         * (1.64/4.81 ~= 0.34), which crops far too aggressively. This value is a middle ground:
+         * zoom 0.3x-1x keeps a visible zoom response while 0.9x stays close to the rear main
+         * 1x field of view, so the crossover to the rear main sensor remains smooth.
+         * Tune this single value if the ultra-wide zoom feels too weak or too strong.
+         */
+        /**
+         * Widest ultra-wide zoom. At this zoom the crop is exactly 1.0, i.e. the native
+         * ultra-wide sensor frame, so the shader never samples outside the texture (which shows
+         * up as coloured edge artifacts). Zooming towards 1x only increases the crop, scaling by
+         * the focal-length ratio (rear main 4.81mm / ultra-wide 1.64mm ~= 2.93x).
+         */
+        private const val ULTRA_WIDE_RELATIVE_ZOOM = 0.3f
+        private const val MIN_ZOOM_RATIO = 0.3f
+        /** Crop is never below 1.0: the widest frame is the native sensor frame. */
+        private const val MIN_CROP = 1f
+        /**
+         * Upper crop bound: the focal-length ratio (rear main 4.81mm / ultra-wide 1.64mm ~= 2.93).
+         * Above this the shader would sample outside the area the sensor actually captured, which
+         * shows up as coloured edge artifacts.
+         */
+        private const val MAX_CROP = 2.93f
+        /**
+         * How strongly the ultra-wide frame crops as zoom goes from 0.3x to 1x. A gentler slope
+         * keeps 0.9x much closer to the rear main 1x framing; the focal-length ratio (~2.93 over
+         * the 0.3x-1x span, i.e. slope ~4.2) crops far too hard. Tune this single value for fine
+         * adjustment of the ultra-wide zoom response.
+         */
+        private const val ULTRA_WIDE_CROP_SLOPE = 0.34f
         private const val FLOAT_SIZE_BYTES = 4
         private val VERTICES = floatArrayOf(-1f,-1f,0f,0f, 1f,-1f,1f,0f, -1f,1f,0f,1f, 1f,1f,1f,1f)
 
